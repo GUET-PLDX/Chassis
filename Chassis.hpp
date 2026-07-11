@@ -168,10 +168,10 @@ required_hardware:
   - can
   - bmi088
 depends:
-  - qdu-future/BMI088
-  - qdu-future/RMMotor
-  - qdu-future/CMD
-  - xrobot-org/MadgwickAHRS
+  - pldx/BMI088
+  - pldx/RMMotor
+  - pldx/CMD
+  - pldx/MadgwickAHRS
 === END MANIFEST === */
 // clang-format on
 
