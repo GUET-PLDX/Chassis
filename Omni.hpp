@@ -43,8 +43,9 @@ class Omni {
     float wheel_to_center = 0.0f;
     float gravity_height = 0.0f;
     float reduction_ratio = 0.0f;
-    float wheel_resistance = 0.0f;
-    float error_compensation = 0.0f;
+    float wheel_resistance = 0.0f; /* Wheel-side resistance torque, N*m. */
+    float error_compensation =
+        0.0f; /* Full-compensation wheel speed, rad/s; zero disables ramping. */
     float gravity = 0.0f;
     float length = 0.0f;
     float width = 0.0f;
@@ -224,7 +225,6 @@ class Omni {
 
       if (referee_suber.Available()) {
         omni->referee_chassis_pack_ = referee_suber.GetData();
-        omni->referee_last_rx_time_ = LibXR::Timebase::GetMilliseconds();
         referee_suber.StartWaiting();
       }
 
@@ -270,8 +270,10 @@ class Omni {
     last_online_time_ = now;
 
     for (int i = 0; i < 4; i++) {
-      motor_wheel_[i]->Update();
+      const bool WHEEL_UPDATE_OK =
+          motor_wheel_[i]->Update() == LibXR::ErrorCode::OK;
       motor_feedback_[i] = motor_wheel_[i]->GetFeedback();
+      motor_online_3508_[i] = WHEEL_UPDATE_OK && motor_feedback_[i].state != 0U;
     }
   }
 
@@ -380,6 +382,22 @@ class Omni {
     } else {
       return (fabs(x) - dz) * (x > 0.0f ? 1.0f : -1.0f);
     }
+  }
+
+  /* Calculate wheel-side resistance compensation torque in N*m. */
+  float ResistanceTorque(float target_omega) const {
+    constexpr float RESISTANCE_EPSILON = 1e-6f;
+    if (PARAM.wheel_resistance <= RESISTANCE_EPSILON ||
+        fabsf(target_omega) <= RESISTANCE_EPSILON) {
+      return 0.0f;
+    }
+
+    if (PARAM.error_compensation > RESISTANCE_EPSILON) {
+      return PARAM.wheel_resistance *
+             std::clamp(target_omega / PARAM.error_compensation, -1.0f, 1.0f);
+    }
+
+    return copysignf(PARAM.wheel_resistance, target_omega);
   }
 
   /**
@@ -572,7 +590,8 @@ class Omni {
       /* 合成动力学输出和上坡前馈 */
       for (int i = 0; i < 4; i++) {
         output_[i] = target_motor_force_[i] * PARAM.wheel_radius +
-                     target_motor_current_[i] + torque_ff_[i];
+                     target_motor_current_[i] + torque_ff_[i] +
+                     ResistanceTorque(target_motor_omega_[i]);
       }
     }
   }
@@ -587,9 +606,9 @@ class Omni {
           motor_feedback_[i].torque * M3508_NM_TO_LSB_RATIO;
     }
 
-    power_control_->SetMotorData3508(motor_data_.output_current_3508,
-                                     motor_data_.rotorspeed_rpm_3508);
-    power_control_->CalculatePowerControlParam();
+    power_control_->SetMotorFeedback3508(motor_data_.output_current_3508,
+                                         motor_data_.rotorspeed_rpm_3508, 4,
+                                         motor_online_3508_);
 
     float speed_error[4];
     for (int i = 0; i < 4; i++) {
@@ -602,31 +621,11 @@ class Omni {
 
     power_control_->SetMotorData3508(motor_data_.output_current_3508,
                                      motor_data_.rotorspeed_rpm_3508,
-                                     speed_error);
+                                     speed_error, 4, motor_online_3508_);
 
-    auto now_ms = LibXR::Timebase::GetMilliseconds();
-    bool referee_online = (now_ms - referee_last_rx_time_).ToSecondf() <= 1.0f;
-    bool power_control_online = power_control_->IsOnline();
-    bool boost_mode = (cmd_data_.self_define == CMD::ChasStat::BOOST);
-
-    float max_power =
-        static_cast<float>(referee_chassis_pack_.rs.chassis_power_limit);
-    if (!referee_online || max_power <= 1.0f) {
-      max_power = OMNI_CHASSIS_MAX_POWER;
-    }
-
-    if (power_control_online && boost_mode) {
-      float cap_energy = power_control_->GetCapEnergy();
-      if (cap_energy > 0.8f) {
-        max_power += 300.0f;
-      } else if (cap_energy > 0.5f) {
-        max_power += 200.0f;
-      } else if (cap_energy > 0.25f) {
-        max_power += 100.0f;
-      }
-    }
-
-    power_control_->OutputLimit(max_power);
+    power_control_->SetBoostRequested(cmd_data_.self_define ==
+                                      CMD::ChasStat::BOOST);
+    power_control_->OutputLimit();
     power_control_data_ = power_control_->GetPowerControlData();
 
     float req_current_abs_sum = 0.0f;
@@ -648,7 +647,7 @@ class Omni {
     }
 
     float buffer_scale = 1.0f;
-    if (referee_online) {
+    if (power_control_data_.referee_energy_buffer_online) {
       float buffer_range =
           std::max(PARAM.rotor_buffer_high_j - PARAM.rotor_buffer_low_j, 1.0f);
       float referee_buffer_j =
@@ -685,15 +684,20 @@ class Omni {
   void DynamicInverseSolution() {
     const float SQRT2 = 1.41421356237f;
 
-    float force_x = pid_velocity_x_.Calculate(target_vx_, now_vx_, dt_);
-    float force_y = pid_velocity_y_.Calculate(target_vy_, now_vy_, dt_);
-    float force_z = pid_omega_.Calculate(target_omega_, now_omega_, dt_);
+    const float FORCE_X = pid_velocity_x_.Calculate(target_vx_, now_vx_, dt_);
+    const float FORCE_Y = pid_velocity_y_.Calculate(target_vy_, now_vy_, dt_);
+    const float TORQUE_Z = pid_omega_.Calculate(target_omega_, now_omega_, dt_);
+    const float TANGENTIAL_FORCE_Z = TORQUE_Z / PARAM.wheel_to_center;
 
     /* 按全向轮受力方向分配前馈力 */
-    target_motor_force_[0] = (-SQRT2 * force_x - SQRT2 * force_y + force_z) / 4;
-    target_motor_force_[1] = (SQRT2 * force_x - SQRT2 * force_y + force_z) / 4;
-    target_motor_force_[2] = (SQRT2 * force_x + SQRT2 * force_y + force_z) / 4;
-    target_motor_force_[3] = (-SQRT2 * force_x + SQRT2 * force_y + force_z) / 4;
+    target_motor_force_[0] =
+        (-SQRT2 * FORCE_X - SQRT2 * FORCE_Y + TANGENTIAL_FORCE_Z) / 4;
+    target_motor_force_[1] =
+        (SQRT2 * FORCE_X - SQRT2 * FORCE_Y + TANGENTIAL_FORCE_Z) / 4;
+    target_motor_force_[2] =
+        (SQRT2 * FORCE_X + SQRT2 * FORCE_Y + TANGENTIAL_FORCE_Z) / 4;
+    target_motor_force_[3] =
+        (-SQRT2 * FORCE_X + SQRT2 * FORCE_Y + TANGENTIAL_FORCE_Z) / 4;
   }
 
   /**
@@ -701,14 +705,10 @@ class Omni {
    * @details 限幅并输出四个全向轮的电流控制指令
    */
   void OutputToDynamics() {
-    /* 功率受限时使用限幅后的电流反算输出扭矩 */
-    if (power_control_data_.is_power_limited) {
-      for (int i = 0; i < 4; i++) {
-        output_[i] =
-            std::clamp(power_control_data_.new_output_current_3508[i] /
-                           M3508_NM_TO_LSB_RATIO * PARAM.reduction_ratio,
-                       -6.0f, 6.0f);
-      }
+    for (int i = 0; i < 4; i++) {
+      output_[i] = std::clamp(power_control_data_.new_output_current_3508[i] /
+                                  M3508_NM_TO_LSB_RATIO * PARAM.reduction_ratio,
+                              -6.0f, 6.0f);
     }
     if (chassis_event_ == ChassisMode::RELAX) {
       LostCtrl();
@@ -1045,6 +1045,7 @@ class Omni {
 
   Motor* motor_wheel_[4]{motor_wheel_0_, motor_wheel_1_, motor_wheel_2_,
                          motor_wheel_3_};
+  bool motor_online_3508_[4]{};
   Motor::Feedback motor_feedback_[4]{};
   Motor::MotorCmd motor_cmd_[4]{};
   MotorData motor_data_{};
@@ -1082,7 +1083,6 @@ class Omni {
 
   Referee* referee_;
   Referee::ChassisPack referee_chassis_pack_{};
-  LibXR::MillisecondTimestamp referee_last_rx_time_ = 0;
 
   LibXR::EulerAngle<float> euler_;
   ChassisMode chassis_event_ = ChassisMode::RELAX;

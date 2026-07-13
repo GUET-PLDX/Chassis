@@ -204,7 +204,6 @@ class Helm {
 
       if (referee_suber.Available()) {
         helm->referee_chassis_pack_ = referee_suber.GetData();
-        helm->referee_last_rx_time_ = LibXR::Timebase::GetMilliseconds();
         referee_suber.StartWaiting();
       }
 
@@ -236,10 +235,16 @@ class Helm {
     last_online_time_ = now;
 
     for (int i = 0; i < 4; i++) {
-      motor_wheel_[i]->Update();
-      motor_steer_[i]->Update();
+      const bool WHEEL_UPDATE_OK =
+          motor_wheel_[i]->Update() == LibXR::ErrorCode::OK;
+      const bool STEER_UPDATE_OK =
+          motor_steer_[i]->Update() == LibXR::ErrorCode::OK;
       motor_wheel_feedback_[i] = motor_wheel_[i]->GetFeedback();
       motor_steer_feedback_[i] = motor_steer_[i]->GetFeedback();
+      motor_online_3508_[i] =
+          WHEEL_UPDATE_OK && motor_wheel_feedback_[i].state != 0U;
+      motor_online_6020_[i] =
+          STEER_UPDATE_OK && motor_steer_feedback_[i].state != 0U;
     }
   }
 
@@ -298,13 +303,13 @@ class Helm {
     }
 
     /* 第一次设置: 反馈数据用于 RLS 参数估计 */
-    power_control_->SetMotorData3508(motor_data_.output_current_3508,
-                                     motor_data_.rotorspeed_rpm_3508);
+    power_control_->SetMotorFeedback3508(motor_data_.output_current_3508,
+                                         motor_data_.rotorspeed_rpm_3508, 4,
+                                         motor_online_3508_);
 
-    power_control_->SetMotorData6020(motor_data_.output_current_6020,
-                                     motor_data_.rotorspeed_rpm_6020);
-
-    power_control_->CalculatePowerControlParam();
+    power_control_->SetMotorFeedback6020(motor_data_.output_current_6020,
+                                         motor_data_.rotorspeed_rpm_6020, 4,
+                                         motor_online_6020_);
 
     /* 计算 3508 速度跟踪误差 */
     float speed_error_3508[4];
@@ -312,7 +317,8 @@ class Helm {
       float actual_speed = motor_reverse_[i]
                                ? -motor_wheel_feedback_[i].velocity
                                : motor_wheel_feedback_[i].velocity;
-      speed_error_3508[i] = target_speed_[i] - actual_speed;
+      speed_error_3508[i] = (target_speed_[i] - actual_speed) *
+                            static_cast<float>(LibXR::TWO_PI) / 60.0f;
 
       motor_data_.output_current_3508[i] = std::clamp(
           wheel_out_[i] * M3508_NM_TO_LSB_RATIO / PARAM.reduction_ratio,
@@ -331,34 +337,14 @@ class Helm {
 
     power_control_->SetMotorData3508(motor_data_.output_current_3508,
                                      motor_data_.rotorspeed_rpm_3508,
-                                     speed_error_3508);
+                                     speed_error_3508, 4, motor_online_3508_);
     power_control_->SetMotorData6020(motor_data_.output_current_6020,
                                      motor_data_.rotorspeed_rpm_6020,
-                                     speed_error_6020);
+                                     speed_error_6020, 4, motor_online_6020_);
 
-    auto now_ms = LibXR::Timebase::GetMilliseconds();
-    bool referee_online = (now_ms - referee_last_rx_time_).ToSecondf() <= 1.0f;
-    bool power_control_online = power_control_->IsOnline();
-    bool boost_mode = (cmd_data_.self_define == CMD::ChasStat::BOOST);
-
-    float max_power =
-        static_cast<float>(referee_chassis_pack_.rs.chassis_power_limit);
-    if (!referee_online || max_power <= 1.0f) {
-      max_power = HELM_CHASSIS_MAX_POWER;
-    }
-
-    if (power_control_online && boost_mode) {
-      float cap_energy = power_control_->GetCapEnergy();
-      if (cap_energy > 0.8f) {
-        max_power += 100.0f;
-      } else if (cap_energy > 0.5f) {
-        max_power += 70.0f;
-      } else if (cap_energy > 0.25f) {
-        max_power += 40.0f;
-      }
-    }
-
-    power_control_->OutputLimit(max_power);
+    power_control_->SetBoostRequested(cmd_data_.self_define ==
+                                      CMD::ChasStat::BOOST);
+    power_control_->OutputLimit();
     power_control_data_ = power_control_->GetPowerControlData();
   }
 
@@ -493,17 +479,15 @@ class Helm {
    *
    */
   void Output() {
-    if (power_control_data_.is_power_limited) {
-      for (int i = 0; i < 4; i++) {
-        wheel_out_[i] =
-            std::clamp(power_control_data_.new_output_current_3508[i] /
-                           M3508_NM_TO_LSB_RATIO * PARAM.reduction_ratio,
-                       -4.4f, 4.4f);
-        steer_out_[i] = static_cast<float>(
-            std ::clamp(power_control_data_.new_output_current_6020[i] /
-                            GM6020_NM_TO_LSB_RATIO * 1.0,
-                        -2.5, 2.5));
-      }
+    for (int i = 0; i < 4; i++) {
+      wheel_out_[i] =
+          std::clamp(power_control_data_.new_output_current_3508[i] /
+                         M3508_NM_TO_LSB_RATIO * PARAM.reduction_ratio,
+                     -4.4f, 4.4f);
+      steer_out_[i] = static_cast<float>(
+          std ::clamp(power_control_data_.new_output_current_6020[i] /
+                          GM6020_NM_TO_LSB_RATIO * 1.0,
+                      -2.5, 2.5));
     }
 
     if (chassis_event_ == (ChassisMode::RELAX)) {
@@ -563,6 +547,8 @@ class Helm {
   Motor* motor_steer_[4] = {motor_steer_0_, motor_steer_1_, motor_steer_2_,
                             motor_steer_3_};
 
+  bool motor_online_3508_[4]{};
+  bool motor_online_6020_[4]{};
   Motor::Feedback motor_wheel_feedback_[4]{};
   Motor::Feedback motor_steer_feedback_[4]{};
 
@@ -598,7 +584,6 @@ class Helm {
   PowerControlData power_control_data_;
 
   Referee::ChassisPack referee_chassis_pack_{};
-  LibXR::MillisecondTimestamp referee_last_rx_time_ = 0;
   LibXR::Thread thread_;
   LibXR::Mutex mutex_;
 

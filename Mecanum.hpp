@@ -238,7 +238,6 @@ class Mecanum {
 
       if (referee_suber.Available()) {
         mecanum->referee_chassis_pack_ = referee_suber.GetData();
-        mecanum->referee_last_rx_time_ = LibXR::Timebase::GetMilliseconds();
         referee_suber.StartWaiting();
       }
 
@@ -276,17 +275,22 @@ class Mecanum {
     last_online_time_ = now;
 
     for (int i = 0; i < 4; i++) {
-      motor_wheel_[i]->Update();
+      const bool WHEEL_UPDATE_OK =
+          motor_wheel_[i]->Update() == LibXR::ErrorCode::OK;
       motor_feedback_[i] = motor_wheel_[i]->GetFeedback();
+      motor_online_3508_[i] = WHEEL_UPDATE_OK && motor_feedback_[i].state != 0U;
     }
   }
   void UpdateTrack() {
     if (track_motor_ == nullptr) {
+      motor_online_3508_[4] = false;
       track_linear_speed_ = 0.0f;
       return;
     }
-    track_motor_->Update();
+    const bool TRACK_UPDATE_OK = track_motor_->Update() == LibXR::ErrorCode::OK;
     track_motor_feedback_ = track_motor_->GetFeedback();
+    motor_online_3508_[4] =
+        TRACK_UPDATE_OK && track_motor_feedback_.state != 0U;
     /* 转子角速度换算为履带线速度 */
     track_linear_speed_ = track_motor_feedback_.omega / PARAM.reduction_ratio *
                           TRACK_WHEEL_RADIUS_M;
@@ -477,10 +481,9 @@ class Mecanum {
             ? 0.0f
             : track_motor_feedback_.torque * M3508_NM_TO_LSB_RATIO;
 
-    power_control_->SetMotorData3508(motor_data_.output_current_3508,
-                                     motor_data_.rotorspeed_rpm_3508);
-
-    power_control_->CalculatePowerControlParam();
+    power_control_->SetMotorFeedback3508(motor_data_.output_current_3508,
+                                         motor_data_.rotorspeed_rpm_3508, 5,
+                                         motor_online_3508_);
 
     float speed_error[5] = {};
 
@@ -501,9 +504,9 @@ class Mecanum {
 
     power_control_->SetMotorData3508(motor_data_.output_current_3508,
                                      motor_data_.rotorspeed_rpm_3508,
-                                     speed_error);
+                                     speed_error, 5, motor_online_3508_);
     PowerControl::AllocationBias3508 allocation_bias{};
-    if (track_motor_ != nullptr && chassis_event_ == ChassisMode::TRACK_START) {
+    if (motor_online_3508_[4] && chassis_event_ == ChassisMode::TRACK_START) {
       const float TRACK_CMD_MAG = GetTrackCommandMagnitude();
       const bool TRACK_ACTIVE = TRACK_CMD_MAG > TRACK_ACTIVE_SPEED_EPS_MPS;
       const bool TRACK_STALLED =
@@ -539,31 +542,9 @@ class Mecanum {
     }
     power_control_->SetAllocationBias3508(allocation_bias);
 
-    auto now_ms = LibXR::Timebase::GetMilliseconds();
-    bool referee_online = (now_ms - referee_last_rx_time_).ToSecondf() <= 1.0f;
-    bool power_control_online = power_control_->IsOnline();
-    bool boost_mode = (cmd_data_.self_define == CMD::ChasStat::BOOST);
-
-    /* 裁判系统离线或上限异常时回退到本地默认功率上限 */
-    float max_power =
-        static_cast<float>(referee_chassis_pack_.rs.chassis_power_limit);
-    if (!referee_online || max_power <= 1.0f) {
-      max_power = MECANUM_CHASSIS_MAX_POWER;
-    }
-
-    /* BOOST 模式按电容能量分档提升可用功率上限 */
-    if (power_control_online && boost_mode) {
-      float cap_energy = power_control_->GetCapEnergy();
-      if (cap_energy > 0.8f) {
-        max_power += 300.0f;
-      } else if (cap_energy > 0.5f) {
-        max_power += 200.0f;
-      } else if (cap_energy > 0.25f) {
-        max_power += 100.0f;
-      }
-    }
-
-    power_control_->OutputLimit(max_power);
+    power_control_->SetBoostRequested(cmd_data_.self_define ==
+                                      CMD::ChasStat::BOOST);
+    power_control_->OutputLimit();
     power_control_data_ = power_control_->GetPowerControlData();
 
     /* 受限程度估计为限幅后电流总量除以请求电流总量 */
@@ -587,7 +568,7 @@ class Mecanum {
 
     /* 将裁判缓冲能量映射为缩放因子离线时保持 1.0 */
     float buffer_scale = 1.0f;
-    if (referee_online) {
+    if (power_control_data_.referee_energy_buffer_online) {
       float buffer_range =
           std::max(PARAM.rotor_buffer_high_j - PARAM.rotor_buffer_low_j, 1.0f);
       float referee_buffer_j =
@@ -640,13 +621,10 @@ class Mecanum {
    * @details 限幅并输出四个麦轮的电流控制指令
    */
   void OutputToDynamics() {
-    if (power_control_data_.is_power_limited) {
-      for (int i = 0; i < 4; i++) {
-        output_[i] =
-            std::clamp(power_control_data_.new_output_current_3508[i] /
-                           M3508_NM_TO_LSB_RATIO * PARAM.reduction_ratio,
-                       -6.0f, 6.0f);
-      }
+    for (int i = 0; i < 4; i++) {
+      output_[i] = std::clamp(power_control_data_.new_output_current_3508[i] /
+                                  M3508_NM_TO_LSB_RATIO * PARAM.reduction_ratio,
+                              -6.0f, 6.0f);
     }
     if (chassis_event_ == ChassisMode::RELAX) {
       LostCtrl();
@@ -709,13 +687,10 @@ class Mecanum {
       track_motor_->Relax();
       return;
     }
-    if (POWER_CONTROL_DATA.is_power_limited) {
-      /* 限功率时使用第五路重新分配后的电流 */
-      track_output_current =
-          std::clamp(POWER_CONTROL_DATA.new_output_current_3508[4] /
-                         static_cast<float>(M3508_MAX_ABS_LSB),
-                     -1.0f, 1.0f);
-    }
+    track_output_current =
+        std::clamp(POWER_CONTROL_DATA.new_output_current_3508[4] /
+                       static_cast<float>(M3508_MAX_ABS_LSB),
+                   -1.0f, 1.0f);
 
     /* 按麦轮相同的电流到输出轴扭矩关系下发 */
     track_motor_cmd_.torque = std::clamp(
@@ -883,6 +858,7 @@ class Mecanum {
 
   Motor* motor_wheel_[4]{motor_wheel_0_, motor_wheel_1_, motor_wheel_2_,
                          motor_wheel_3_};
+  bool motor_online_3508_[5]{};
   Motor::Feedback motor_feedback_[4]{};
   Motor::MotorCmd motor_cmd_[4]{};
   MotorData motor_data_{};
@@ -925,7 +901,6 @@ class Mecanum {
   PowerControl* power_control_;
   PowerControlData power_control_data_;
 
-  LibXR::MillisecondTimestamp referee_last_rx_time_ = 0;
   Referee::ChassisPack referee_chassis_pack_{};
 
   LibXR::Thread thread_;

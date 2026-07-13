@@ -6,6 +6,9 @@ on:
   schedule:
     - cron: '0 3 1 * *'  # 每月1日凌晨3点（UTC）自动触发
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -56,38 +59,38 @@ jobs:
       - name: Checkout Motor module
         uses: actions/checkout@v4
         with:
-          repository: QDU-Robomaster/Motor
+          repository: GUET-PLDX/Motor
           path: Modules/Motor
 
       - name: Checkout RMMotor module
         uses: actions/checkout@v4
         with:
-          repository: QDU-Robomaster/RMMotor
-          ref: master
+          repository: GUET-PLDX/RMMotor
+          ref: main
           path: Modules/RMMotor
 
       - name: Checkout CMD module
         uses: actions/checkout@v4
         with:
-          repository: QDU-Robomaster/CMD
+          repository: GUET-PLDX/CMD
           path: Modules/CMD
 
       - name: Checkout PowerControl module
         uses: actions/checkout@v4
         with:
-          repository: QDU-Robomaster/PowerControl
+          repository: GUET-PLDX/PowerControl
           path: Modules/PowerControl
 
       - name: Checkout SuperPower module
         uses: actions/checkout@v4
         with:
-          repository: QDU-Robomaster/SuperPower
+          repository: GUET-PLDX/SuperPower
           path: Modules/SuperPower
 
       - name: Checkout Referee module
         uses: actions/checkout@v4
         with:
-          repository: QDU-Robomaster/Referee
+          repository: GUET-PLDX/Referee
           path: Modules/Referee
 
       - name: Setup Python & Install deps

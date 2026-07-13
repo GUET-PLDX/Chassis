@@ -169,9 +169,13 @@ required_hardware:
   - bmi088
 depends:
   - pldx/BMI088
+  - pldx/Motor
   - pldx/RMMotor
   - pldx/CMD
   - pldx/MadgwickAHRS
+  - pldx/PowerControl
+  - pldx/Referee
+  - pldx/SuperPower
 === END MANIFEST === */
 // clang-format on
 
