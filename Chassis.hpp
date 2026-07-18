@@ -24,8 +24,8 @@ constructor_args:
       wheel_resistance: 0.0
       error_compensation: 0.0
       gravity: 230
-      length = 0.0f;
-      width = 0.0f;
+      length: 0.0
+      width: 0.0
       rotor_speed_scale: 0.95
       rotor_omega_min_scale: 0.55
       rotor_buffer_low_j: 35.0
