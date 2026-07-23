@@ -195,6 +195,7 @@ class Mecanum {
           UNUSED(event_id);
           mecanum->mutex_.Lock();
           mecanum->chassis_event_ = ChassisMode::RELAX;
+          mecanum->LostCtrl();
           mecanum->mutex_.Unlock();
         },
         this);
@@ -257,8 +258,8 @@ class Mecanum {
       mecanum->CalculateMotorCurrent();
       mecanum->CalculateTrackCurrent();
       mecanum->PowerControlUpdate();
-      mecanum->mutex_.Unlock();
       mecanum->OutputToDynamics();
+      mecanum->mutex_.Unlock();
       mecanum->ControlTrack();
 
       mecanum->thread_.SleepUntil(last_time, 2);
@@ -678,27 +679,25 @@ class Mecanum {
     }
 
     mutex_.Lock();
-    const bool RELAX = chassis_event_ == ChassisMode::RELAX;
-    float track_output_current = track_output_current_;
-    const PowerControlData POWER_CONTROL_DATA = power_control_data_;
-    mutex_.Unlock();
-
-    if (RELAX) {
+    if (chassis_event_ == ChassisMode::RELAX) {
       track_motor_->Relax();
+      mutex_.Unlock();
       return;
     }
-    track_output_current =
+    const PowerControlData POWER_CONTROL_DATA = power_control_data_;
+    const float TRACK_OUTPUT_CURRENT =
         std::clamp(POWER_CONTROL_DATA.new_output_current_3508[4] /
                        static_cast<float>(M3508_MAX_ABS_LSB),
                    -1.0f, 1.0f);
 
     /* 按麦轮相同的电流到输出轴扭矩关系下发 */
     track_motor_cmd_.torque = std::clamp(
-        track_output_current * static_cast<float>(M3508_MAX_ABS_LSB) /
+        TRACK_OUTPUT_CURRENT * static_cast<float>(M3508_MAX_ABS_LSB) /
             M3508_NM_TO_LSB_RATIO * PARAM.reduction_ratio,
         -6.0f, 6.0f);
     track_motor_cmd_.velocity = 0.0f;
     track_motor_->Control(track_motor_cmd_);
+    mutex_.Unlock();
   }
   /**
    * @brief 失去控制处理

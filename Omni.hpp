@@ -182,6 +182,7 @@ class Omni {
           UNUSED(event_id);
           omni->mutex_.Lock();
           omni->chassis_event_ = ChassisMode::RELAX;
+          omni->LostCtrl();
           ResetModeUILocked(omni);
           omni->mutex_.Unlock();
         },
@@ -253,8 +254,8 @@ class Omni {
       omni->FeedForward();
       omni->CalculateMotorCurrent();
       omni->PowerControlUpdate();
-      omni->mutex_.Unlock();
       omni->OutputToDynamics();
+      omni->mutex_.Unlock();
 
       omni->thread_.SleepUntil(last_time, 2);
     }

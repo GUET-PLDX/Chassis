@@ -168,8 +168,10 @@ class Helm {
         [](bool in_isr, Helm* helm, uint32_t event_id) {
           UNUSED(in_isr);
           UNUSED(event_id);
+          helm->mutex_.Lock();
           helm->chassis_event_ = ChassisMode::RELAX;
           helm->LostCtrl();
+          helm->mutex_.Unlock();
         },
         this);
     cmd_->GetEvent().Register(CMD::CMD_EVENT_LOST_CTRL, lost_ctrl_callback);
@@ -217,11 +219,11 @@ class Helm {
       helm->mutex_.Lock();
       helm->Update();
       helm->UpdateCMD();
-      helm->topic_delta_yaw_.Publish(helm->delta_yaw_);
       helm->Helmcontrol();
       helm->PowerControlUpdate();
-      helm->mutex_.Unlock();
       helm->Output();
+      helm->mutex_.Unlock();
+      helm->topic_delta_yaw_.Publish(helm->delta_yaw_);
       helm->thread_.SleepUntil(last_time, 2);
     }
   }
