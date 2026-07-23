@@ -25,6 +25,27 @@ extract_block() {
   ' "$file"
 }
 
+extract_block_from_text() {
+  local text=$1
+  local start_pattern=$2
+
+  awk -v start_pattern="$start_pattern" '
+    $0 ~ start_pattern { found = 1 }
+    found {
+      print
+      opens = gsub(/{/, "{")
+      closes = gsub(/}/, "}")
+      if (opens > 0) {
+        started = 1
+      }
+      depth += opens - closes
+      if (started && depth == 0) {
+        exit
+      }
+    }
+  ' <<<"$text"
+}
+
 line_number() {
   local body=$1
   local needle=$2
@@ -114,8 +135,8 @@ check_lost_ctrl_callback() {
 
 check_track_output() {
   local file=$1
-  local body lock_line relax_check_line relax_call_line first_unlock_line
-  local control_line last_unlock_line
+  local body relax_block lock_line relax_check_line relax_block_end_line
+  local relax_call_line relax_unlock_line return_line control_line last_unlock_line
 
   body=$(extract_block "$file" 'void ControlTrack')
   lock_line=$(line_number "$body" 'mutex_.Lock();') || {
@@ -126,12 +147,18 @@ check_track_output() {
     printf 'missing: Mecanum ControlTrack RELAX recheck\n'
     return 1
   }
-  relax_call_line=$(line_number "$body" 'track_motor_->Relax();') || {
+  relax_block=$(extract_block_from_text "$body" \
+    'if \(chassis_event_ == ChassisMode::RELAX\)')
+  relax_call_line=$(line_number "$relax_block" 'track_motor_->Relax();') || {
     printf 'missing: Mecanum ControlTrack relax submission\n'
     return 1
   }
-  first_unlock_line=$(line_number "$body" 'mutex_.Unlock();') || {
-    printf 'missing: Mecanum ControlTrack unlock\n'
+  relax_unlock_line=$(line_number "$relax_block" 'mutex_.Unlock();') || {
+    printf 'missing: Mecanum ControlTrack RELAX branch unlock\n'
+    return 1
+  }
+  return_line=$(line_number "$relax_block" 'return;') || {
+    printf 'missing: Mecanum ControlTrack RELAX branch return\n'
     return 1
   }
   control_line=$(line_number "$body" 'track_motor_->Control(track_motor_cmd_);') || {
@@ -139,10 +166,15 @@ check_track_output() {
     return 1
   }
   last_unlock_line=$(line_number "$body" 'mutex_.Unlock();' last) || return 1
+  relax_block_end_line=$((relax_check_line + $(wc -l <<<"$relax_block") - 1))
 
-  if ! ((lock_line < relax_check_line && relax_check_line < relax_call_line &&
-         relax_call_line < first_unlock_line)); then
-    printf 'misordered: Mecanum ControlTrack observes RELAX after unlock\n'
+  if ! ((relax_call_line < relax_unlock_line &&
+         relax_unlock_line < return_line)); then
+    printf 'misordered: Mecanum ControlTrack RELAX branch must Relax -> Unlock -> return\n'
+    return 1
+  fi
+  if ! ((lock_line < relax_check_line && relax_block_end_line < control_line)); then
+    printf 'misordered: Mecanum ControlTrack control must follow the terminating RELAX branch\n'
     return 1
   fi
   if ((control_line >= last_unlock_line)); then
@@ -196,6 +228,15 @@ run_mutation_checks() {
     "$mutation_dir/Mecanum.hpp"
   if check_track_output "$mutation_dir/Mecanum.hpp" >/dev/null; then
     printf 'mutation survived: Mecanum track unlock-before-control\n'
+    return 1
+  fi
+
+  cp "$ROOT_DIR/Mecanum.hpp" "$mutation_dir/Mecanum.hpp"
+  perl -0pi -e \
+    's/(      track_motor_->Relax\(\);\n      mutex_\.Unlock\(\);\n)      return;\n/$1/' \
+    "$mutation_dir/Mecanum.hpp"
+  if check_track_output "$mutation_dir/Mecanum.hpp" >/dev/null; then
+    printf 'mutation survived: Mecanum RELAX branch missing return\n'
     return 1
   fi
 }
