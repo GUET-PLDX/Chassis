@@ -16,6 +16,7 @@ depends: []
 #include <cstdio>
 
 #include "CMD.hpp"
+#include "ChassisWheelTelemetry.hpp"
 #include "Motor.hpp"
 #include "PowerControl.hpp"
 #include "Referee.hpp"
@@ -55,6 +56,8 @@ class Omni {
     float rotor_buffer_low_j = 35.0f;    /* 缓冲能量低阈值 J */
     float rotor_buffer_high_j = 70.0f;   /* 缓冲能量高阈值 J */
     float rotor_scale_lpf_alpha = 0.2f;  /* 动态缩放一阶低通系数 */
+    uint32_t telemetry_feedback_max_age_ms = 30U;
+    uint32_t telemetry_max_sample_skew_ms = 3U;
   };
   enum class ChassisMode : uint8_t {
     RELAX,
@@ -114,6 +117,8 @@ class Omni {
        LibXR::PID<float>::Param pid_steer_speed_3,
        LibXR::Thread::Priority thread_priority = LibXR::Thread::Priority::HIGH)
       : PARAM(chassis_param),
+        wheel_telemetry_topic_(LibXR::Topic::CreateTopic<ChassisWheelTelemetry>(
+            "chassis_wheel_telemetry", nullptr, true)),
         motor_wheel_0_(motor_wheel_0),   /* wheel0   ▲ y  wheel3 */
         motor_wheel_1_(motor_wheel_1),   /*     ↙    │     ↖     */
         motor_wheel_2_(motor_wheel_2),   /*          │           */
@@ -249,6 +254,7 @@ class Omni {
       omni->Update();
       omni->UpdateCMD();
       omni->SelfResolution();
+      omni->PublishWheelTelemetry();
       omni->InverseKinematicsSolution();
       omni->DynamicInverseSolution();
       omni->FeedForward();
@@ -551,6 +557,53 @@ class Omni {
                   motor_feedback_[2].omega / PARAM.reduction_ratio +
                   motor_feedback_[3].omega / PARAM.reduction_ratio) *
                  PARAM.wheel_radius / (4.0f * PARAM.wheel_to_center);
+  }
+
+  void PublishWheelTelemetry() {
+    constexpr uint64_t TELEMETRY_PERIOD_US = 10000U;
+    constexpr uint32_t REFEREE_POWER_MAX_AGE_MS = 250U;
+    const uint64_t NOW_US =
+        static_cast<uint64_t>(LibXR::Timebase::GetMicroseconds());
+    if (last_telemetry_publish_time_us_ != 0U &&
+        NOW_US - last_telemetry_publish_time_us_ < TELEMETRY_PERIOD_US) {
+      return;
+    }
+    last_telemetry_publish_time_us_ = NOW_US;
+
+    ChassisWheelTelemetryDetail::SampleInput input;
+    input.now_us = NOW_US;
+    input.feedback_max_age_us = PARAM.telemetry_feedback_max_age_ms * 1000U;
+    input.max_sample_skew_us = PARAM.telemetry_max_sample_skew_ms * 1000U;
+    input.reduction_ratio = PARAM.reduction_ratio;
+    input.wheel_radius = PARAM.wheel_radius;
+    input.wheel_to_center = PARAM.wheel_to_center;
+    const uint32_t NOW_MS =
+        static_cast<uint32_t>(LibXR::Timebase::GetMilliseconds());
+    input.power_state_valid =
+        referee_chassis_pack_.robot_status_received &&
+        static_cast<uint32_t>(
+            NOW_MS - referee_chassis_pack_.robot_status_received_time_ms) <=
+            REFEREE_POWER_MAX_AGE_MS;
+    input.chassis_power_on =
+        referee_chassis_pack_.rs.power_chassis_output != 0U;
+
+    for (uint8_t index = 0U; index < 4U; ++index) {
+      input.wheel[index] = {
+          motor_feedback_[index].received_time_us,
+          motor_feedback_[index].sequence,
+          motor_feedback_[index].omega,
+          motor_feedback_[index].torque,
+          motor_feedback_[index].temp,
+          motor_feedback_[index].error_id,
+          motor_feedback_[index].state != 0U,
+          motor_online_3508_[index],
+      };
+    }
+
+    ++wheel_telemetry_sequence_;
+    wheel_telemetry_ = ChassisWheelTelemetryDetail::BuildSample(
+        input, wheel_telemetry_sequence_);
+    wheel_telemetry_topic_.Publish(wheel_telemetry_);
   }
 
   /**
@@ -1000,6 +1053,10 @@ class Omni {
 
  private:
   const ChassisParam PARAM;
+  LibXR::Topic wheel_telemetry_topic_;
+  ChassisWheelTelemetry wheel_telemetry_{};
+  uint64_t last_telemetry_publish_time_us_ = 0U;
+  uint16_t wheel_telemetry_sequence_ = 0U;
 
   float target_motor_omega_[4]{0.0f, 0.0f, 0.0f, 0.0f};
   float target_motor_force_[4]{0.0f, 0.0f, 0.0f, 0.0f};
