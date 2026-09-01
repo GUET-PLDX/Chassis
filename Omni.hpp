@@ -18,6 +18,7 @@ depends: []
 #include "CMD.hpp"
 #include "ChassisWheelTelemetry.hpp"
 #include "Motor.hpp"
+#include "OmniCommandContract.hpp"
 #include "PowerControl.hpp"
 #include "Referee.hpp"
 #include "app_framework.hpp"
@@ -27,10 +28,9 @@ depends: []
 #include "pid.hpp"
 #include "timebase.hpp"
 #include "timer.hpp"
+#include "transform.hpp"
 
 #define M3508_NM_TO_LSB_RATIO 52437.5f /* 3508 转子扭矩到电机控制值的比例 */
-
-#define OMNI_MOTOR_MAX_OMEGA 52 /* 全向轮输出轴最大角速度 rad/s */
 
 #define OMNI_CHASSIS_MAX_POWER 100 /* 裁判系统离线时的默认功率上限 W */
 
@@ -308,7 +308,69 @@ class Omni {
    * @details 从CMD获取底盘控制指令，并转换为目标速度
    */
   void UpdateCMD() {
-    float max_v = PARAM.wheel_radius * OMNI_MOTOR_MAX_OMEGA;
+    if (cmd_data_.si_units) {
+      if (!Pldx::ChassisCommandContract::is_valid_si(cmd_data_.x, cmd_data_.y,
+                                                     cmd_data_.z)) {
+        chassis_event_ = ChassisMode::RELAX;
+        target_vx_ = 0.0F;
+        target_vy_ = 0.0F;
+        target_omega_ = 0.0F;
+        force_control_ = false;
+        return;
+      }
+      if (cmd_data_.force_control &&
+          (!std::isfinite(cmd_data_.force_x_global_n) ||
+           !std::isfinite(cmd_data_.force_y_global_n) ||
+           !std::isfinite(cmd_data_.torque_z_global_nm) ||
+           std::fabs(cmd_data_.force_x_global_n) > 200.0F ||
+           std::fabs(cmd_data_.force_y_global_n) > 200.0F ||
+           std::fabs(cmd_data_.torque_z_global_nm) > 100.0F)) {
+        chassis_event_ = ChassisMode::RELAX;
+        force_control_ = false;
+        target_vx_ = target_vy_ = target_omega_ = 0.0F;
+        return;
+      }
+      force_control_ =
+          cmd_data_.force_control && chassis_event_ != ChassisMode::RELAX;
+      external_force_x_global_n_ =
+          force_control_ ? cmd_data_.force_x_global_n : 0.0F;
+      external_force_y_global_n_ =
+          force_control_ ? cmd_data_.force_y_global_n : 0.0F;
+      external_torque_z_global_nm_ =
+          force_control_ ? cmd_data_.torque_z_global_nm : 0.0F;
+      if (chassis_event_ == ChassisMode::RELAX) {
+        target_vx_ = 0.0F;
+        target_vy_ = 0.0F;
+        target_omega_ = 0.0F;
+      } else if (force_control_) {
+        target_vx_ = 0.0F;
+        target_vy_ = 0.0F;
+        if (chassis_event_ == ChassisMode::ROTOR) {
+          const float max_v =
+              PARAM.wheel_radius *
+              Pldx::OmniCommandContract::MAX_WHEEL_ANGULAR_VELOCITY_RAD_S;
+          target_omega_ = -max_v / PARAM.wheel_to_center;
+        } else if (chassis_event_ == ChassisMode::FOLLOW) {
+          target_omega_ = -pid_follow_.Calculate(0.0f, yawmotor_angle_, dt_);
+        } else {
+          target_omega_ = 0.0F;
+        }
+      } else {
+        target_vx_ = cmd_data_.x;
+        target_vy_ = cmd_data_.y;
+        target_omega_ = cmd_data_.z;
+      }
+      return;
+    }
+
+    force_control_ = false;
+    external_force_x_global_n_ = 0.0F;
+    external_force_y_global_n_ = 0.0F;
+    external_torque_z_global_nm_ = 0.0F;
+
+    const float max_v =
+        PARAM.wheel_radius *
+        Pldx::OmniCommandContract::MAX_WHEEL_ANGULAR_VELOCITY_RAD_S;
 
     /* 先生成目标角速度 */
     switch (chassis_event_) {
@@ -411,30 +473,9 @@ class Omni {
    * @brief 计算姿态前馈
    */
   void FeedForward() {
-    /* 角度先包到正负 pi */
-    auto WrapToPi = [](float a) {
-      while (a > M_PI) a -= 2.0f * M_PI;
-      while (a < -M_PI) a += 2.0f * M_PI;
-      return a;
+    const auto wrap_to_pi = [](float angle) {
+      return LibXR::CycleValue<float>(angle) - 0.0f;
     };
-
-    float yaw_g = WrapToPi(imu_yaw_);
-    float pitch_g = WrapToPi(imu_pitch_);
-    float roll_g = WrapToPi(imu_roll_);
-
-    float yaw_m = WrapToPi(yawmotor_angle_);
-    float pitch_m = WrapToPi(pitchmotor_angle_);
-
-    /* 预计算姿态三角函数 */
-    float cy = cosf(yaw_g), sy = sinf(yaw_g);
-    float cp = cosf(pitch_g), sp = sinf(pitch_g);
-    float cr = cosf(roll_g), sr = sinf(roll_g);
-
-    float cy_m = cosf(yaw_m), sy_m = sinf(yaw_m);
-    float cp_m = cosf(pitch_m), sp_m = sinf(pitch_m);
-
-    /* 世界系到云台系的旋转矩阵 */
-    float R_wg[3][3];
 
     post_x_[0] = -PARAM.width / 2;
     post_x_[1] = -PARAM.width / 2;
@@ -446,63 +487,22 @@ class Omni {
     post_y_[2] = -PARAM.length / 2;
     post_y_[3] = PARAM.length / 2;
 
-    R_wg[0][0] = cy * cp;
-    R_wg[0][1] = cy * sp * sr - sy * cr;
-    R_wg[0][2] = cy * sp * cr + sy * sr;
+    const LibXR::RotationMatrix<float> R_wg(
+        LibXR::EulerAngle<float>(wrap_to_pi(imu_roll_), wrap_to_pi(imu_pitch_),
+                                 wrap_to_pi(imu_yaw_))
+            .ToRotationMatrixZYX());
+    const LibXR::RotationMatrix<float> R_cg(
+        LibXR::EulerAngle<float>(0.0f, wrap_to_pi(pitchmotor_angle_),
+                                 wrap_to_pi(yawmotor_angle_))
+            .ToRotationMatrixZYX());
+    const LibXR::RotationMatrix<float> R_gc(-R_cg);
+    const LibXR::RotationMatrix<float> R_wc = R_wg * R_gc;
 
-    R_wg[1][0] = sy * cp;
-    R_wg[1][1] = sy * sp * sr + cy * cr;
-    R_wg[1][2] = sy * sp * cr - cy * sr;
+    const float val = std::clamp(static_cast<float>(-R_wc(2, 0)), -1.0f, 1.0f);
+    chassis_pitch_ = wrap_to_pi(asinf(val));
+    chassis_roll_ = wrap_to_pi(atan2f(R_wc(2, 1), R_wc(2, 2)));
 
-    R_wg[2][0] = -sp;
-    R_wg[2][1] = cp * sr;
-    R_wg[2][2] = cp * cr;
-
-    /* 底盘系到云台系的旋转矩阵 */
-    float R_cg[3][3];
-
-    R_cg[0][0] = cy_m * cp_m;
-    R_cg[0][1] = -sy_m;
-    R_cg[0][2] = cy_m * sp_m;
-
-    R_cg[1][0] = sy_m * cp_m;
-    R_cg[1][1] = cy_m;
-    R_cg[1][2] = sy_m * sp_m;
-
-    R_cg[2][0] = -sp_m;
-    R_cg[2][1] = 0.0f;
-    R_cg[2][2] = cp_m;
-
-    /* 转置得到云台系到底盘系的旋转矩阵 */
-    float R_gc[3][3];
-    for (int i = 0; i < 3; i++) {
-      for (int j = 0; j < 3; j++) {
-        R_gc[i][j] = R_cg[j][i];
-      }
-    }
-
-    /* 合成世界系到底盘系的旋转矩阵 */
-    float R_wc[3][3] = {{0}};
-
-    for (int i = 0; i < 3; i++) {
-      for (int j = 0; j < 3; j++) {
-        R_wc[i][j] = R_wg[i][0] * R_gc[0][j] + R_wg[i][1] * R_gc[1][j] +
-                     R_wg[i][2] * R_gc[2][j];
-      }
-    }
-
-    /* 提取底盘俯仰和横滚用于前馈 */
-    float val = -R_wc[2][0];
-    if (val > 1.0f) val = 1.0f;
-    if (val < -1.0f) val = -1.0f;
-
-    chassis_pitch_ = asinf(val);
-    chassis_roll_ = atan2f(R_wc[2][1], R_wc[2][2]);
-
-    chassis_pitch_ = WrapToPi(chassis_pitch_);
-    chassis_roll_ = WrapToPi(chassis_roll_);
-
-    float k = M_PI / 50;
+    float k = static_cast<float>(LibXR::PI / 50.0);
     gy_ff_ = -PARAM.gravity * SoftDeadzone(sinf(chassis_pitch_), sinf(k));
     gx_ff_ = -PARAM.gravity * SoftDeadzone(sinf(chassis_roll_), sinf(k));
 
@@ -611,20 +611,26 @@ class Omni {
    * @details 根据目标底盘速度（vx, vy, ω），计算四个全向轮的目标角速度
    */
   void InverseKinematicsSolution() {
-    const float SQRT1 = 0.70710678118f;
+    const auto TARGETS = Pldx::OmniCommandContract::Resolve(
+        target_vx_, target_vy_, target_omega_, PARAM.wheel_radius,
+        PARAM.wheel_to_center);
+    if (!TARGETS.valid) {
+      chassis_event_ = ChassisMode::RELAX;
+      target_vx_ = 0.0F;
+      target_vy_ = 0.0F;
+      target_omega_ = 0.0F;
+      for (float& target : target_motor_omega_) {
+        target = 0.0F;
+      }
+      return;
+    }
 
-    target_motor_omega_[0] = (-SQRT1 * target_vx_ - SQRT1 * target_vy_ +
-                              target_omega_ * PARAM.wheel_to_center) /
-                             PARAM.wheel_radius;
-    target_motor_omega_[1] = (SQRT1 * target_vx_ - SQRT1 * target_vy_ +
-                              target_omega_ * PARAM.wheel_to_center) /
-                             PARAM.wheel_radius;
-    target_motor_omega_[2] = (SQRT1 * target_vx_ + SQRT1 * target_vy_ +
-                              target_omega_ * PARAM.wheel_to_center) /
-                             PARAM.wheel_radius;
-    target_motor_omega_[3] = (-SQRT1 * target_vx_ + SQRT1 * target_vy_ +
-                              target_omega_ * PARAM.wheel_to_center) /
-                             PARAM.wheel_radius;
+    target_vx_ *= TARGETS.scale;
+    target_vy_ *= TARGETS.scale;
+    target_omega_ *= TARGETS.scale;
+    for (size_t index = 0U; index < TARGETS.angular_velocity.size(); ++index) {
+      target_motor_omega_[index] = TARGETS.angular_velocity[index];
+    }
   }
 
   /**
@@ -738,9 +744,29 @@ class Omni {
   void DynamicInverseSolution() {
     const float SQRT2 = 1.41421356237f;
 
-    const float FORCE_X = pid_velocity_x_.Calculate(target_vx_, now_vx_, dt_);
-    const float FORCE_Y = pid_velocity_y_.Calculate(target_vy_, now_vy_, dt_);
-    const float TORQUE_Z = pid_omega_.Calculate(target_omega_, now_omega_, dt_);
+    if (force_control_ && !std::isfinite(imu_yaw_)) {
+      chassis_event_ = ChassisMode::RELAX;
+      force_control_ = false;
+      for (float& force : target_motor_force_) {
+        force = 0.0F;
+      }
+      return;
+    }
+
+    float FORCE_X = pid_velocity_x_.Calculate(target_vx_, now_vx_, dt_);
+    float FORCE_Y = pid_velocity_y_.Calculate(target_vy_, now_vy_, dt_);
+    float TORQUE_Z = pid_omega_.Calculate(target_omega_, now_omega_, dt_);
+    if (force_control_) {
+      const float CY = cosf(imu_yaw_);
+      const float SY = sinf(imu_yaw_);
+      FORCE_X =
+          CY * external_force_x_global_n_ + SY * external_force_y_global_n_;
+      FORCE_Y =
+          -SY * external_force_x_global_n_ + CY * external_force_y_global_n_;
+      if (chassis_event_ == ChassisMode::INDEPENDENT) {
+        TORQUE_Z = external_torque_z_global_nm_;
+      }
+    }
     const float TANGENTIAL_FORCE_Z = TORQUE_Z / PARAM.wheel_to_center;
 
     /* 按全向轮受力方向分配前馈力 */
@@ -1071,6 +1097,10 @@ class Omni {
   float target_vx_ = 0.0f;
   float target_vy_ = 0.0f;
   float target_omega_ = 0.0f;
+  float external_force_x_global_n_ = 0.0F;
+  float external_force_y_global_n_ = 0.0F;
+  float external_torque_z_global_nm_ = 0.0F;
+  bool force_control_ = false;
   float rotor_dynamic_scale_ = 1.0f; /* 功率相关动态缩放 */
 
   float imu_yaw_ = 0.0f;
@@ -1134,7 +1164,7 @@ class Omni {
   LibXR::Mutex mutex_;
 
   CMD* cmd_;
-  CMD::ChassisCMD cmd_data_;
+  CMD::ChassisCMD cmd_data_{};
 
   PowerControl* power_control_;
   PowerControlData power_control_data_;

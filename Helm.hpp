@@ -413,8 +413,9 @@ class Helm {
       case (ChassisMode::ROTOR): {
         float x = 0, y = 0, wheel_pos = 0;
         for (int i = 0; i < 4; i++) {
-          wheel_pos = -static_cast<float>(i) * static_cast<float>(M_PI_2) +
-                      static_cast<float>(M_PI) / 4.0f * 3.0f;
+          wheel_pos =
+              -static_cast<float>(i) * static_cast<float>(LibXR::PI / 2.0) +
+              static_cast<float>(LibXR::PI) / 4.0f * 3.0f;
           x = -sinf(wheel_pos) * target_omega_ * SQRT2 + target_vx_;
           y = -cosf(wheel_pos) * target_omega_ * SQRT2 + target_vy_;
 
@@ -422,7 +423,8 @@ class Helm {
             target_angle_[i] = wheel_pos;
             target_speed_[i] = 0.0f;
           } else {
-            target_angle_[i] = M_PI_2 - atan2f(y, x);
+            target_angle_[i] =
+                static_cast<float>(LibXR::PI / 2.0) - atan2f(y, x);
             target_speed_[i] = motor_max_speed_ * (fmaxf(fabsf(x), fabsf(y)));
           }
         }
@@ -439,7 +441,7 @@ class Helm {
     for (int i = 0; i < 4; i++) {
       if (fabs(
               LibXR::CycleValue(motor_steer_feedback_[i].abs_angle - zero_[i]) -
-              target_angle_[i]) > M_PI_2) {
+              target_angle_[i]) > static_cast<float>(LibXR::PI / 2.0)) {
         motor_reverse_[i] = true;
       } else {
         motor_reverse_[i] = false;
@@ -454,7 +456,7 @@ class Helm {
 
         steer_angle_[i] = pid_steer_angle_[i].Calculate(
             LibXR::CycleValue<float>(target_angle_[i] +
-                                     static_cast<float>(M_PI) + zero_[i]),
+                                     static_cast<float>(LibXR::PI) + zero_[i]),
             motor_steer_feedback_[i].abs_angle, dt_);
         steer_out_[i] = pid_steer_speed_[i].Calculate(
             steer_angle_[i],
