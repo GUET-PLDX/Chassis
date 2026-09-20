@@ -16,7 +16,6 @@ depends: []
 #include <cstdio>
 
 #include "CMD.hpp"
-#include "ChassisWheelTelemetry.hpp"
 #include "Motor.hpp"
 #include "OmniCommandContract.hpp"
 #include "PowerControl.hpp"
@@ -31,6 +30,8 @@ depends: []
 #include "transform.hpp"
 
 #define M3508_NM_TO_LSB_RATIO 52437.5f /* 3508 转子扭矩到电机控制值的比例 */
+
+#define OMNI_MOTOR_MAX_OMEGA 52 /* 全向轮输出轴最大角速度 rad/s */
 
 #define OMNI_CHASSIS_MAX_POWER 100 /* 裁判系统离线时的默认功率上限 W */
 
@@ -56,14 +57,13 @@ class Omni {
     float rotor_buffer_low_j = 35.0f;    /* 缓冲能量低阈值 J */
     float rotor_buffer_high_j = 70.0f;   /* 缓冲能量高阈值 J */
     float rotor_scale_lpf_alpha = 0.2f;  /* 动态缩放一阶低通系数 */
-    uint32_t telemetry_feedback_max_age_ms = 30U;
-    uint32_t telemetry_max_sample_skew_ms = 3U;
   };
   enum class ChassisMode : uint8_t {
     RELAX,
     INDEPENDENT,
     ROTOR,
     FOLLOW,
+    NAVIGATION,
   };
 
   /**
@@ -117,8 +117,6 @@ class Omni {
        LibXR::PID<float>::Param pid_steer_speed_3,
        LibXR::Thread::Priority thread_priority = LibXR::Thread::Priority::HIGH)
       : PARAM(chassis_param),
-        wheel_telemetry_topic_(LibXR::Topic::CreateTopic<ChassisWheelTelemetry>(
-            "chassis_wheel_telemetry", nullptr, true)),
         motor_wheel_0_(motor_wheel_0),   /* wheel0   ▲ y  wheel3 */
         motor_wheel_1_(motor_wheel_1),   /*     ↙    │     ↖     */
         motor_wheel_2_(motor_wheel_2),   /*          │           */
@@ -254,7 +252,6 @@ class Omni {
       omni->Update();
       omni->UpdateCMD();
       omni->SelfResolution();
-      omni->PublishWheelTelemetry();
       omni->InverseKinematicsSolution();
       omni->DynamicInverseSolution();
       omni->FeedForward();
@@ -263,7 +260,7 @@ class Omni {
       omni->OutputToDynamics();
       omni->mutex_.Unlock();
 
-      omni->thread_.SleepUntil(last_time, 2);
+      omni->thread_.SleepUntil(last_time, 1);
     }
   }
 
@@ -308,119 +305,94 @@ class Omni {
    * @details 从CMD获取底盘控制指令，并转换为目标速度
    */
   void UpdateCMD() {
-    if (cmd_data_.si_units) {
-      if (!Pldx::ChassisCommandContract::is_valid_si(cmd_data_.x, cmd_data_.y,
-                                                     cmd_data_.z)) {
-        chassis_event_ = ChassisMode::RELAX;
-        target_vx_ = 0.0F;
-        target_vy_ = 0.0F;
-        target_omega_ = 0.0F;
-        force_control_ = false;
-        return;
-      }
-      if (cmd_data_.force_control &&
-          (!std::isfinite(cmd_data_.force_x_global_n) ||
-           !std::isfinite(cmd_data_.force_y_global_n) ||
-           !std::isfinite(cmd_data_.torque_z_global_nm) ||
-           std::fabs(cmd_data_.force_x_global_n) > 200.0F ||
-           std::fabs(cmd_data_.force_y_global_n) > 200.0F ||
-           std::fabs(cmd_data_.torque_z_global_nm) > 100.0F)) {
-        chassis_event_ = ChassisMode::RELAX;
-        force_control_ = false;
-        target_vx_ = target_vy_ = target_omega_ = 0.0F;
-        return;
-      }
-      force_control_ =
-          cmd_data_.force_control && chassis_event_ != ChassisMode::RELAX;
-      external_force_x_global_n_ =
-          force_control_ ? cmd_data_.force_x_global_n : 0.0F;
-      external_force_y_global_n_ =
-          force_control_ ? cmd_data_.force_y_global_n : 0.0F;
-      external_torque_z_global_nm_ =
-          force_control_ ? cmd_data_.torque_z_global_nm : 0.0F;
-      if (chassis_event_ == ChassisMode::RELAX) {
-        target_vx_ = 0.0F;
-        target_vy_ = 0.0F;
-        target_omega_ = 0.0F;
-      } else if (force_control_) {
-        target_vx_ = 0.0F;
-        target_vy_ = 0.0F;
-        if (chassis_event_ == ChassisMode::ROTOR) {
-          const float max_v =
-              PARAM.wheel_radius *
-              Pldx::OmniCommandContract::MAX_WHEEL_ANGULAR_VELOCITY_RAD_S;
-          target_omega_ = -max_v / PARAM.wheel_to_center;
-        } else if (chassis_event_ == ChassisMode::FOLLOW) {
-          target_omega_ = -pid_follow_.Calculate(0.0f, yawmotor_angle_, dt_);
-        } else {
-          target_omega_ = 0.0F;
-        }
-      } else {
-        target_vx_ = cmd_data_.x;
-        target_vy_ = cmd_data_.y;
-        target_omega_ = cmd_data_.z;
-      }
-      return;
-    }
-
-    force_control_ = false;
-    external_force_x_global_n_ = 0.0F;
-    external_force_y_global_n_ = 0.0F;
-    external_torque_z_global_nm_ = 0.0F;
-
     const float max_v =
-        PARAM.wheel_radius *
-        Pldx::OmniCommandContract::MAX_WHEEL_ANGULAR_VELOCITY_RAD_S;
+        PARAM.wheel_radius * static_cast<float>(OMNI_MOTOR_MAX_OMEGA);
 
-    /* 先生成目标角速度 */
-    switch (chassis_event_) {
-      case ChassisMode::RELAX:
-        target_omega_ = 0.0f;
-        break;
+    if (cmd_data_.source == CMD::ChassisCommandSource::NAVIGATION) {
+      target_vx_ = cmd_data_.navigation_velocity.vx_mps;
+      target_vy_ = cmd_data_.navigation_velocity.vy_mps;
+      switch (chassis_event_) {
+        case ChassisMode::RELAX:
+          target_vx_ = 0.0F;
+          target_vy_ = 0.0F;
+          target_omega_ = 0.0F;
+          break;
+        case ChassisMode::NAVIGATION:
+          target_omega_ = cmd_data_.navigation_velocity.wz_rad_s;
+          break;
+        case ChassisMode::ROTOR:
+          target_omega_ = -static_cast<float>(max_v / PARAM.wheel_to_center);
+          break;
+        case ChassisMode::FOLLOW:
+          target_omega_ = -pid_follow_.Calculate(0.0f, yawmotor_angle_, dt_);
+          break;
+        default:
+          target_vx_ = 0.0F;
+          target_vy_ = 0.0F;
+          target_omega_ = 0.0F;
+          break;
+      }
+    } else {
+      /* 先生成目标角速度 */
+      switch (chassis_event_) {
+        case ChassisMode::RELAX:
+          target_omega_ = 0.0f;
+          break;
 
-      case ChassisMode::INDEPENDENT:
-        target_omega_ = max_v * cmd_data_.z / PARAM.wheel_to_center;
-        break;
+        case ChassisMode::INDEPENDENT:
+          target_omega_ =
+              max_v * cmd_data_.operator_input.z / PARAM.wheel_to_center;
+          break;
 
-      case ChassisMode::ROTOR:
-        target_omega_ = -static_cast<float>(max_v / PARAM.wheel_to_center);
-        break;
+        case ChassisMode::ROTOR:
+          target_omega_ = -static_cast<float>(max_v / PARAM.wheel_to_center);
+          break;
 
-        /* 正方向跟随云台 */
-      case ChassisMode::FOLLOW:
-        target_omega_ = -pid_follow_.Calculate(0.0f, yawmotor_angle_, dt_);
-        break;
+          /* 正方向跟随云台 */
+        case ChassisMode::FOLLOW:
+          target_omega_ = -pid_follow_.Calculate(0.0f, yawmotor_angle_, dt_);
+          break;
 
-      default:
-        break;
-    }
+        case ChassisMode::NAVIGATION:
+          target_omega_ = 0.0F;
+          break;
 
-    /* 再生成目标平移速度 */
-    switch (chassis_event_) {
-      case ChassisMode::RELAX:
-        target_vx_ = 0.0f;
-        target_vy_ = 0.0f;
-        break;
-      case ChassisMode::ROTOR:
-      case ChassisMode::FOLLOW: {
-        float beta = yawmotor_angle_;
-        float cos_beta = cosf(beta);
-        float sin_beta = sinf(beta);
-        target_vx_ =
-            (cos_beta * cmd_data_.x * max_v - sin_beta * cmd_data_.y * max_v);
-        target_vy_ =
-            (sin_beta * cmd_data_.x * max_v + cos_beta * cmd_data_.y * max_v);
-      } break;
-      case ChassisMode::INDEPENDENT: {
-        const float SQRT2 = 1.41421356237f;
-        /* 独立模式用菱形限幅适配摇杆边界 */
-        float s = fabsf(cmd_data_.x) + fabsf(cmd_data_.y);
-        float k = (s <= 1.0f) ? max_v : (max_v / s);
-        target_vx_ = SQRT2 * k * cmd_data_.x;
-        target_vy_ = SQRT2 * k * cmd_data_.y;
-      } break;
-      default:
-        break;
+        default:
+          break;
+      }
+
+      /* 再生成目标平移速度 */
+      switch (chassis_event_) {
+        case ChassisMode::RELAX:
+          target_vx_ = 0.0f;
+          target_vy_ = 0.0f;
+          break;
+        case ChassisMode::ROTOR:
+        case ChassisMode::FOLLOW: {
+          float beta = yawmotor_angle_;
+          float cos_beta = cosf(beta);
+          float sin_beta = sinf(beta);
+          target_vx_ = (cos_beta * cmd_data_.operator_input.x * max_v -
+                        sin_beta * cmd_data_.operator_input.y * max_v);
+          target_vy_ = (sin_beta * cmd_data_.operator_input.x * max_v +
+                        cos_beta * cmd_data_.operator_input.y * max_v);
+        } break;
+        case ChassisMode::INDEPENDENT: {
+          const float SQRT2 = 1.41421356237f;
+          /* 独立模式用菱形限幅适配摇杆边界 */
+          float s = fabsf(cmd_data_.operator_input.x) +
+                    fabsf(cmd_data_.operator_input.y);
+          float k = (s <= 1.0f) ? max_v : (max_v / s);
+          target_vx_ = SQRT2 * k * cmd_data_.operator_input.x;
+          target_vy_ = SQRT2 * k * cmd_data_.operator_input.y;
+        } break;
+        case ChassisMode::NAVIGATION:
+          target_vx_ = 0.0F;
+          target_vy_ = 0.0F;
+          break;
+        default:
+          break;
+      }
     }
 
     /* 小陀螺模式按平移输入和功率状态动态压低转速 */
@@ -559,53 +531,6 @@ class Omni {
                  PARAM.wheel_radius / (4.0f * PARAM.wheel_to_center);
   }
 
-  void PublishWheelTelemetry() {
-    constexpr uint64_t TELEMETRY_PERIOD_US = 10000U;
-    constexpr uint32_t REFEREE_POWER_MAX_AGE_MS = 250U;
-    const uint64_t NOW_US =
-        static_cast<uint64_t>(LibXR::Timebase::GetMicroseconds());
-    if (last_telemetry_publish_time_us_ != 0U &&
-        NOW_US - last_telemetry_publish_time_us_ < TELEMETRY_PERIOD_US) {
-      return;
-    }
-    last_telemetry_publish_time_us_ = NOW_US;
-
-    ChassisWheelTelemetryDetail::SampleInput input;
-    input.now_us = NOW_US;
-    input.feedback_max_age_us = PARAM.telemetry_feedback_max_age_ms * 1000U;
-    input.max_sample_skew_us = PARAM.telemetry_max_sample_skew_ms * 1000U;
-    input.reduction_ratio = PARAM.reduction_ratio;
-    input.wheel_radius = PARAM.wheel_radius;
-    input.wheel_to_center = PARAM.wheel_to_center;
-    const uint32_t NOW_MS =
-        static_cast<uint32_t>(LibXR::Timebase::GetMilliseconds());
-    input.power_state_valid =
-        referee_chassis_pack_.robot_status_received &&
-        static_cast<uint32_t>(
-            NOW_MS - referee_chassis_pack_.robot_status_received_time_ms) <=
-            REFEREE_POWER_MAX_AGE_MS;
-    input.chassis_power_on =
-        referee_chassis_pack_.rs.power_chassis_output != 0U;
-
-    for (uint8_t index = 0U; index < 4U; ++index) {
-      input.wheel[index] = {
-          motor_feedback_[index].received_time_us,
-          motor_feedback_[index].sequence,
-          motor_feedback_[index].omega,
-          motor_feedback_[index].torque,
-          motor_feedback_[index].temp,
-          motor_feedback_[index].error_id,
-          motor_feedback_[index].state != 0U,
-          motor_online_3508_[index],
-      };
-    }
-
-    ++wheel_telemetry_sequence_;
-    wheel_telemetry_ = ChassisWheelTelemetryDetail::BuildSample(
-        input, wheel_telemetry_sequence_);
-    wheel_telemetry_topic_.Publish(wheel_telemetry_);
-  }
-
   /**
    * @brief 全向轮底盘逆运动学解算
    * @details 根据目标底盘速度（vx, vy, ω），计算四个全向轮的目标角速度
@@ -616,15 +541,10 @@ class Omni {
         PARAM.wheel_to_center);
     if (!TARGETS.valid) {
       chassis_event_ = ChassisMode::RELAX;
-      target_vx_ = 0.0F;
-      target_vy_ = 0.0F;
-      target_omega_ = 0.0F;
-      for (float& target : target_motor_omega_) {
-        target = 0.0F;
-      }
+      target_vx_ = target_vy_ = target_omega_ = 0.0F;
+      for (float& target : target_motor_omega_) target = 0.0F;
       return;
     }
-
     target_vx_ *= TARGETS.scale;
     target_vy_ *= TARGETS.scale;
     target_omega_ *= TARGETS.scale;
@@ -744,40 +664,15 @@ class Omni {
   void DynamicInverseSolution() {
     const float SQRT2 = 1.41421356237f;
 
-    if (force_control_ && !std::isfinite(imu_yaw_)) {
-      chassis_event_ = ChassisMode::RELAX;
-      force_control_ = false;
-      for (float& force : target_motor_force_) {
-        force = 0.0F;
-      }
-      return;
-    }
-
-    float FORCE_X = pid_velocity_x_.Calculate(target_vx_, now_vx_, dt_);
-    float FORCE_Y = pid_velocity_y_.Calculate(target_vy_, now_vy_, dt_);
-    float TORQUE_Z = pid_omega_.Calculate(target_omega_, now_omega_, dt_);
-    if (force_control_) {
-      const float CY = cosf(imu_yaw_);
-      const float SY = sinf(imu_yaw_);
-      FORCE_X =
-          CY * external_force_x_global_n_ + SY * external_force_y_global_n_;
-      FORCE_Y =
-          -SY * external_force_x_global_n_ + CY * external_force_y_global_n_;
-      if (chassis_event_ == ChassisMode::INDEPENDENT) {
-        TORQUE_Z = external_torque_z_global_nm_;
-      }
-    }
-    const float TANGENTIAL_FORCE_Z = TORQUE_Z / PARAM.wheel_to_center;
+    const float FORCE_X = pid_velocity_x_.Calculate(target_vx_, now_vx_, dt_);
+    const float FORCE_Y = pid_velocity_y_.Calculate(target_vy_, now_vy_, dt_);
+    const float FORCE_Z = pid_omega_.Calculate(target_omega_, now_omega_, dt_);
 
     /* 按全向轮受力方向分配前馈力 */
-    target_motor_force_[0] =
-        (-SQRT2 * FORCE_X - SQRT2 * FORCE_Y + TANGENTIAL_FORCE_Z) / 4;
-    target_motor_force_[1] =
-        (SQRT2 * FORCE_X - SQRT2 * FORCE_Y + TANGENTIAL_FORCE_Z) / 4;
-    target_motor_force_[2] =
-        (SQRT2 * FORCE_X + SQRT2 * FORCE_Y + TANGENTIAL_FORCE_Z) / 4;
-    target_motor_force_[3] =
-        (-SQRT2 * FORCE_X + SQRT2 * FORCE_Y + TANGENTIAL_FORCE_Z) / 4;
+    target_motor_force_[0] = (-SQRT2 * FORCE_X - SQRT2 * FORCE_Y + FORCE_Z) / 4;
+    target_motor_force_[1] = (SQRT2 * FORCE_X - SQRT2 * FORCE_Y + FORCE_Z) / 4;
+    target_motor_force_[2] = (SQRT2 * FORCE_X + SQRT2 * FORCE_Y + FORCE_Z) / 4;
+    target_motor_force_[3] = (-SQRT2 * FORCE_X + SQRT2 * FORCE_Y + FORCE_Z) / 4;
   }
 
   /**
@@ -1079,10 +974,6 @@ class Omni {
 
  private:
   const ChassisParam PARAM;
-  LibXR::Topic wheel_telemetry_topic_;
-  ChassisWheelTelemetry wheel_telemetry_{};
-  uint64_t last_telemetry_publish_time_us_ = 0U;
-  uint16_t wheel_telemetry_sequence_ = 0U;
 
   float target_motor_omega_[4]{0.0f, 0.0f, 0.0f, 0.0f};
   float target_motor_force_[4]{0.0f, 0.0f, 0.0f, 0.0f};
@@ -1097,10 +988,6 @@ class Omni {
   float target_vx_ = 0.0f;
   float target_vy_ = 0.0f;
   float target_omega_ = 0.0f;
-  float external_force_x_global_n_ = 0.0F;
-  float external_force_y_global_n_ = 0.0F;
-  float external_torque_z_global_nm_ = 0.0F;
-  bool force_control_ = false;
   float rotor_dynamic_scale_ = 1.0f; /* 功率相关动态缩放 */
 
   float imu_yaw_ = 0.0f;

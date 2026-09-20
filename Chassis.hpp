@@ -31,8 +31,6 @@ constructor_args:
       rotor_buffer_low_j: 35.0
       rotor_buffer_high_j: 70.0
       rotor_scale_lpf_alpha: 0.2
-      telemetry_feedback_max_age_ms: 30
-      telemetry_max_sample_skew_ms: 3
   - pid_follow_:
       k: 1.0
       p: 20.0
@@ -225,8 +223,6 @@ class Chassis : public LibXR::Application {
     float rotor_buffer_low_j = 35.0f;
     float rotor_buffer_high_j = 70.0f;
     float rotor_scale_lpf_alpha = 0.2f;
-    uint32_t telemetry_feedback_max_age_ms = 30U;
-    uint32_t telemetry_max_sample_skew_ms = 3U;
   };
 
   Chassis(
@@ -267,16 +263,13 @@ class Chassis : public LibXR::Application {
                 chassis_param.rotor_omega_min_scale,
                 chassis_param.rotor_buffer_low_j,
                 chassis_param.rotor_buffer_high_j,
-                chassis_param.rotor_scale_lpf_alpha,
-                chassis_param.telemetry_feedback_max_age_ms,
-                chassis_param.telemetry_max_sample_skew_ms},
+                chassis_param.rotor_scale_lpf_alpha},
             pid_follow_, pid_velocity_x_, pid_velocity_y_, pid_omega_,
             pid_wheel_speed_0_, pid_wheel_speed_1_, pid_wheel_speed_2_,
             pid_wheel_speed_3_, pid_steer_angle_0_, pid_steer_angle_1_,
             pid_steer_angle_2_, pid_steer_angle_3_, pid_steer_speed_0_,
             pid_steer_speed_1_, pid_steer_speed_2_, pid_steer_speed_3_,
-            thread_priority),
-        referee_(referee) {
+            thread_priority) {
     auto callback = LibXR::Callback<uint32_t>::Create(
         [](bool in_isr, Chassis* chassis, uint32_t event_id) {
           UNUSED(in_isr);
@@ -322,5 +315,4 @@ class Chassis : public LibXR::Application {
  private:
   ChassisType chassis_;
   LibXR::Event chassis_event_;
-  Referee* referee_;
 };

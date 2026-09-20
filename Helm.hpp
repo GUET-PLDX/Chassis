@@ -284,9 +284,9 @@ class Helm {
    * @details 从CMD获取底盘控制指令,速控底盘
    */
   void UpdateCMD() {
-    target_vx_ = cmd_data_.x;
-    target_vy_ = cmd_data_.y;
-    target_omega_ = cmd_data_.z;
+    target_vx_ = cmd_data_.operator_input.x;
+    target_vy_ = cmd_data_.operator_input.y;
+    target_omega_ = cmd_data_.operator_input.z;
   }
 
   /**
@@ -362,16 +362,18 @@ class Helm {
         target_vy_ = 0.0f;
         break;
       case (ChassisMode::INDEPENDENT): {
-        target_vx_ = cmd_data_.x;
-        target_vy_ = cmd_data_.y;
+        target_vx_ = cmd_data_.operator_input.x;
+        target_vy_ = cmd_data_.operator_input.y;
       } break;
       case (ChassisMode::FOLLOW):
       case (ChassisMode::ROTOR): {
         float beta = current_yaw_;
         float cos_beta = cosf(beta);
         float sin_beta = sinf(beta);
-        target_vx_ = cos_beta * cmd_data_.x - sin_beta * cmd_data_.y;
-        target_vy_ = sin_beta * cmd_data_.x + cos_beta * cmd_data_.y;
+        target_vx_ = cos_beta * cmd_data_.operator_input.x -
+                     sin_beta * cmd_data_.operator_input.y;
+        target_vy_ = sin_beta * cmd_data_.operator_input.x +
+                     cos_beta * cmd_data_.operator_input.y;
       } break;
 
       default:
@@ -388,14 +390,14 @@ class Helm {
         break;
       case (ChassisMode::INDEPENDENT):
         /* 独立模式每个轮子的方向相同，wz当作轮子转向角速度 */
-        target_omega_ = -cmd_data_.z;
+        target_omega_ = -cmd_data_.operator_input.z;
         break;
       case (ChassisMode::FOLLOW):
         target_omega_ = pid_follow_.Calculate(0.0f, current_yaw_, dt_);
         break;
       case (ChassisMode::ROTOR):
         /* 陀螺模式底盘以一定速度旋转 */
-        target_omega_ = -cmd_data_.z;
+        target_omega_ = -cmd_data_.operator_input.z;
         break;
       default:
         target_omega_ = 0.0f;

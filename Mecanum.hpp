@@ -327,7 +327,8 @@ class Mecanum {
         break;
 
       case (ChassisMode::INDEPENDENT):
-        target_omega_ = -max_v * cmd_data_.z / PARAM.wheel_to_center;
+        target_omega_ =
+            -max_v * cmd_data_.operator_input.z / PARAM.wheel_to_center;
         break;
 
       case (ChassisMode::ROTOR):
@@ -362,24 +363,25 @@ class Mecanum {
         float beta = -current_yaw_;
         float cos_beta = cosf(beta);
         float sin_beta = sinf(beta);
-        target_vx_ =
-            (cos_beta * cmd_data_.x * max_v + sin_beta * cmd_data_.y * max_v);
-        target_vy_ =
-            (-sin_beta * cmd_data_.x * max_v + cos_beta * cmd_data_.y * max_v);
+        target_vx_ = (cos_beta * cmd_data_.operator_input.x * max_v +
+                      sin_beta * cmd_data_.operator_input.y * max_v);
+        target_vy_ = (-sin_beta * cmd_data_.operator_input.x * max_v +
+                      cos_beta * cmd_data_.operator_input.y * max_v);
       } break;
       case (ChassisMode::TRACK_START): {
         float beta = -current_yaw_;
         float cos_beta = cosf(beta);
         float sin_beta = sinf(beta);
         /* 履带负责前后，麦轮保留横移能力 */
-        float assist_vx = cmd_data_.x * max_v * TRACK_LATERAL_SPEED_SCALE;
+        float assist_vx =
+            cmd_data_.operator_input.x * max_v * TRACK_LATERAL_SPEED_SCALE;
         float assist_vy = GetTrackWheelAssistSpeed();
         target_vx_ = cos_beta * assist_vx + sin_beta * assist_vy;
         target_vy_ = -sin_beta * assist_vx + cos_beta * assist_vy;
       } break;
       case (ChassisMode::INDEPENDENT): {
-        target_vx_ = cmd_data_.x * max_v;
-        target_vy_ = cmd_data_.y * max_v;
+        target_vx_ = cmd_data_.operator_input.x * max_v;
+        target_vy_ = cmd_data_.operator_input.y * max_v;
       } break;
       default:
         break;
@@ -641,18 +643,18 @@ class Mecanum {
   }
   float GetTrackCommandMagnitude() const {
     /* 遥控 y 先缩放再开方让低速段更细 */
-    const float INPUT = cmd_data_.y * TRACK_INPUT_SCALE;
+    const float INPUT = cmd_data_.operator_input.y * TRACK_INPUT_SCALE;
     return std::sqrt(std::abs(INPUT)) * TRACK_MAX_LINEAR_SPEED_MPS;
   }
   float GetTrackSetpointSpeed() const {
     /* 履带电机方向和底盘前进方向相反 */
-    const float INPUT = cmd_data_.y * TRACK_INPUT_SCALE;
+    const float INPUT = cmd_data_.operator_input.y * TRACK_INPUT_SCALE;
     const float SIGN = (INPUT < 0.0f) ? 1.0f : -1.0f;
     return SIGN * GetTrackCommandMagnitude();
   }
   float GetTrackWheelAssistSpeed() const {
     /* 麦轮辅助方向和底盘前进方向一致 */
-    const float INPUT = cmd_data_.y * TRACK_INPUT_SCALE;
+    const float INPUT = cmd_data_.operator_input.y * TRACK_INPUT_SCALE;
     const float SIGN = (INPUT < 0.0f) ? -1.0f : 1.0f;
     return SIGN * GetTrackCommandMagnitude() * TRACK_WHEEL_ASSIST_SCALE;
   }
