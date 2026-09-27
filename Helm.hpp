@@ -14,6 +14,7 @@ depends: []
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <numbers>
 
 #include "CMD.hpp"
 #include "Chassis.hpp"
@@ -382,7 +383,6 @@ class Helm {
         break;
     }
 
-    const float SQRT2 = 1.41421356237f;
     /* 计算 wz */
     switch (chassis_event_) {
       case (ChassisMode::RELAX):
@@ -511,6 +511,9 @@ class Helm {
   }
 
  private:
+  /* 几何/运动学常量（来自 <numbers>，与旧字面量逐位一致） */
+  static constexpr float SQRT2 = static_cast<float>(std::numbers::sqrt2);
+
   const ChassisParam PARAM;
 
   float target_vx_ = 0.0f;

@@ -161,21 +161,21 @@ class Mecanum {
     UNUSED(pid_steer_angle_3);
 
     for (int i = 0; i < 4; i++) {
-      motor_cmd_[i].mode = Motor::ControlMode::MODE_TORQUE;
-      motor_cmd_[i].reduction_ratio = chassis_param.reduction_ratio;
-      motor_cmd_[i].torque = 0.0f;
-      motor_cmd_[i].position = 0.0f;
-      motor_cmd_[i].velocity = 0.0f;
-      motor_cmd_[i].kp = 0.0f;
-      motor_cmd_[i].kd = 0.0f;
+      wheel_command_[i].mode = Motor::ControlMode::MODE_TORQUE;
+      wheel_command_[i].reduction_ratio = chassis_param.reduction_ratio;
+      wheel_command_[i].torque = 0.0f;
+      wheel_command_[i].position = 0.0f;
+      wheel_command_[i].velocity = 0.0f;
+      wheel_command_[i].kp = 0.0f;
+      wheel_command_[i].kd = 0.0f;
     }
-    track_motor_cmd_.mode = Motor::ControlMode::MODE_TORQUE;
-    track_motor_cmd_.reduction_ratio = chassis_param.reduction_ratio;
-    track_motor_cmd_.torque = 0.0f;
-    track_motor_cmd_.position = 0.0f;
-    track_motor_cmd_.velocity = 0.0f;
-    track_motor_cmd_.kp = 0.0f;
-    track_motor_cmd_.kd = 0.0f;
+    track_wheel_command_.mode = Motor::ControlMode::MODE_TORQUE;
+    track_wheel_command_.reduction_ratio = chassis_param.reduction_ratio;
+    track_wheel_command_.torque = 0.0f;
+    track_wheel_command_.position = 0.0f;
+    track_wheel_command_.velocity = 0.0f;
+    track_wheel_command_.kp = 0.0f;
+    track_wheel_command_.kd = 0.0f;
 
     thread_.Create(this, ThreadFunction, "MecanumChassisThread",
                    task_stack_depth, thread_priority);
@@ -278,8 +278,8 @@ class Mecanum {
     for (int i = 0; i < 4; i++) {
       const bool WHEEL_UPDATE_OK =
           motor_wheel_[i]->Update() == LibXR::ErrorCode::OK;
-      motor_feedback_[i] = motor_wheel_[i]->GetFeedback();
-      motor_online_3508_[i] = WHEEL_UPDATE_OK && motor_feedback_[i].state != 0U;
+      wheel_feedback_[i] = motor_wheel_[i]->GetFeedback();
+      motor_online_3508_[i] = WHEEL_UPDATE_OK && wheel_feedback_[i].state != 0U;
     }
   }
   void UpdateTrack() {
@@ -289,11 +289,11 @@ class Mecanum {
       return;
     }
     const bool TRACK_UPDATE_OK = track_motor_->Update() == LibXR::ErrorCode::OK;
-    track_motor_feedback_ = track_motor_->GetFeedback();
+    track_wheel_feedback_ = track_motor_->GetFeedback();
     motor_online_3508_[4] =
-        TRACK_UPDATE_OK && track_motor_feedback_.state != 0U;
+        TRACK_UPDATE_OK && track_wheel_feedback_.state != 0U;
     /* 转子角速度换算为履带线速度 */
-    track_linear_speed_ = track_motor_feedback_.omega / PARAM.reduction_ratio *
+    track_linear_speed_ = track_wheel_feedback_.omega / PARAM.reduction_ratio *
                           TRACK_WHEEL_RADIUS_M;
   }
 
@@ -323,29 +323,33 @@ class Mecanum {
     /* 先生成目标角速度 */
     switch (chassis_event_) {
       case (ChassisMode::RELAX):
-        target_omega_ = 0.0f;
+        chassis_omega_setpoint_ = 0.0f;
         break;
 
       case (ChassisMode::INDEPENDENT):
-        target_omega_ =
+        chassis_omega_setpoint_ =
             -max_v * cmd_data_.operator_input.z / PARAM.wheel_to_center;
         break;
 
       case (ChassisMode::ROTOR):
-        this->target_omega_ = static_cast<float>(max_v / PARAM.wheel_to_center);
+        this->chassis_omega_setpoint_ =
+            static_cast<float>(max_v / PARAM.wheel_to_center);
         break;
 
       case (ChassisMode::FOLLOW):
-        target_omega_ = -pid_follow_.Calculate(0.0f, -current_yaw_, dt_);
+        chassis_omega_setpoint_ =
+            -pid_follow_.Calculate(0.0f, -current_yaw_, dt_);
         break;
 
       case (ChassisMode::TRACK_START): {
         float max_omega = max_v / PARAM.wheel_to_center;
         /* 履带模式只保留小幅 FOLLOW 纠偏 */
-        target_omega_ = -pid_follow_.Calculate(0.0f, -current_yaw_, dt_);
-        target_omega_ = std::clamp(target_omega_,
-                                   -max_omega * TRACK_FOLLOW_OMEGA_LIMIT_SCALE,
-                                   max_omega * TRACK_FOLLOW_OMEGA_LIMIT_SCALE);
+        chassis_omega_setpoint_ =
+            -pid_follow_.Calculate(0.0f, -current_yaw_, dt_);
+        chassis_omega_setpoint_ =
+            std::clamp(chassis_omega_setpoint_,
+                       -max_omega * TRACK_FOLLOW_OMEGA_LIMIT_SCALE,
+                       max_omega * TRACK_FOLLOW_OMEGA_LIMIT_SCALE);
       } break;
 
       default:
@@ -355,18 +359,18 @@ class Mecanum {
     /* 再生成目标平移速度 */
     switch (chassis_event_) {
       case (ChassisMode::RELAX):
-        target_vx_ = 0.0f;
-        target_vy_ = 0.0f;
+        chassis_vx_setpoint_ = 0.0f;
+        chassis_vy_setpoint_ = 0.0f;
         break;
       case (ChassisMode::ROTOR):
       case (ChassisMode::FOLLOW): {
         float beta = -current_yaw_;
         float cos_beta = cosf(beta);
         float sin_beta = sinf(beta);
-        target_vx_ = (cos_beta * cmd_data_.operator_input.x * max_v +
-                      sin_beta * cmd_data_.operator_input.y * max_v);
-        target_vy_ = (-sin_beta * cmd_data_.operator_input.x * max_v +
-                      cos_beta * cmd_data_.operator_input.y * max_v);
+        chassis_vx_setpoint_ = (cos_beta * cmd_data_.operator_input.x * max_v +
+                                sin_beta * cmd_data_.operator_input.y * max_v);
+        chassis_vy_setpoint_ = (-sin_beta * cmd_data_.operator_input.x * max_v +
+                                cos_beta * cmd_data_.operator_input.y * max_v);
       } break;
       case (ChassisMode::TRACK_START): {
         float beta = -current_yaw_;
@@ -376,12 +380,12 @@ class Mecanum {
         float assist_vx =
             cmd_data_.operator_input.x * max_v * TRACK_LATERAL_SPEED_SCALE;
         float assist_vy = GetTrackWheelAssistSpeed();
-        target_vx_ = cos_beta * assist_vx + sin_beta * assist_vy;
-        target_vy_ = -sin_beta * assist_vx + cos_beta * assist_vy;
+        chassis_vx_setpoint_ = cos_beta * assist_vx + sin_beta * assist_vy;
+        chassis_vy_setpoint_ = -sin_beta * assist_vx + cos_beta * assist_vy;
       } break;
       case (ChassisMode::INDEPENDENT): {
-        target_vx_ = cmd_data_.operator_input.x * max_v;
-        target_vy_ = cmd_data_.operator_input.y * max_v;
+        chassis_vx_setpoint_ = cmd_data_.operator_input.x * max_v;
+        chassis_vy_setpoint_ = cmd_data_.operator_input.y * max_v;
       } break;
       default:
         break;
@@ -391,7 +395,8 @@ class Mecanum {
     float rotor_translation_scale = 1.0f;
     if (chassis_event_ == ChassisMode::ROTOR) {
       float translation_magnitude =
-          sqrtf(target_vx_ * target_vx_ + target_vy_ * target_vy_);
+          sqrtf(chassis_vx_setpoint_ * chassis_vx_setpoint_ +
+                chassis_vy_setpoint_ * chassis_vy_setpoint_);
       float translation_ratio = 0.0f;
       if (max_v > 1e-3f) {
         translation_ratio =
@@ -399,7 +404,7 @@ class Mecanum {
       }
       rotor_translation_scale =
           1.0f - (1.0f - PARAM.rotor_speed_scale) * translation_ratio;
-      target_omega_ *= rotor_translation_scale * rotor_dynamic_scale_;
+      chassis_omega_setpoint_ *= rotor_translation_scale * rotor_dynamic_scale_;
     }
   }
 
@@ -408,23 +413,24 @@ class Mecanum {
    * @details 根据四个麦轮的角速度，解算出底盘当前的运动状态
    */
   void SelfResolution() {
-    now_vx_ = (motor_feedback_[0].omega / PARAM.reduction_ratio -
-               motor_feedback_[1].omega / PARAM.reduction_ratio -
-               motor_feedback_[2].omega / PARAM.reduction_ratio +
-               motor_feedback_[3].omega / PARAM.reduction_ratio) *
-              PARAM.wheel_radius / 4.0f;
+    chassis_vx_feedback_ = (wheel_feedback_[0].omega / PARAM.reduction_ratio -
+                            wheel_feedback_[1].omega / PARAM.reduction_ratio -
+                            wheel_feedback_[2].omega / PARAM.reduction_ratio +
+                            wheel_feedback_[3].omega / PARAM.reduction_ratio) *
+                           PARAM.wheel_radius / 4.0f;
 
-    now_vy_ = (motor_feedback_[0].omega / PARAM.reduction_ratio +
-               motor_feedback_[1].omega / PARAM.reduction_ratio -
-               motor_feedback_[2].omega / PARAM.reduction_ratio -
-               motor_feedback_[3].omega / PARAM.reduction_ratio) *
-              PARAM.wheel_radius / 4.0f;
+    chassis_vy_feedback_ = (wheel_feedback_[0].omega / PARAM.reduction_ratio +
+                            wheel_feedback_[1].omega / PARAM.reduction_ratio -
+                            wheel_feedback_[2].omega / PARAM.reduction_ratio -
+                            wheel_feedback_[3].omega / PARAM.reduction_ratio) *
+                           PARAM.wheel_radius / 4.0f;
 
-    now_omega_ = (motor_feedback_[0].omega / PARAM.reduction_ratio +
-                  motor_feedback_[1].omega / PARAM.reduction_ratio +
-                  motor_feedback_[2].omega / PARAM.reduction_ratio +
-                  motor_feedback_[3].omega / PARAM.reduction_ratio) *
-                 PARAM.wheel_radius / (4.0f * PARAM.wheel_to_center);
+    chassis_omega_feedback_ =
+        (wheel_feedback_[0].omega / PARAM.reduction_ratio +
+         wheel_feedback_[1].omega / PARAM.reduction_ratio +
+         wheel_feedback_[2].omega / PARAM.reduction_ratio +
+         wheel_feedback_[3].omega / PARAM.reduction_ratio) *
+        PARAM.wheel_radius / (4.0f * PARAM.wheel_to_center);
   }
 
   /**
@@ -432,17 +438,21 @@ class Mecanum {
    * @details 根据目标底盘速度（vx, vy, ω），计算四个麦轮的目标角速度
    */
   void InverseKinematicsSolution() {
-    target_motor_omega_[0] =
-        (target_vx_ + target_vy_ + target_omega_ * PARAM.wheel_to_center) /
+    wheel_omega_setpoint_[0] =
+        (chassis_vx_setpoint_ + chassis_vy_setpoint_ +
+         chassis_omega_setpoint_ * PARAM.wheel_to_center) /
         PARAM.wheel_radius;
-    target_motor_omega_[1] =
-        (-target_vx_ + target_vy_ + target_omega_ * PARAM.wheel_to_center) /
+    wheel_omega_setpoint_[1] =
+        (-chassis_vx_setpoint_ + chassis_vy_setpoint_ +
+         chassis_omega_setpoint_ * PARAM.wheel_to_center) /
         PARAM.wheel_radius;
-    target_motor_omega_[2] =
-        (-target_vx_ - target_vy_ + target_omega_ * PARAM.wheel_to_center) /
+    wheel_omega_setpoint_[2] =
+        (-chassis_vx_setpoint_ - chassis_vy_setpoint_ +
+         chassis_omega_setpoint_ * PARAM.wheel_to_center) /
         PARAM.wheel_radius;
-    target_motor_omega_[3] =
-        (target_vx_ - target_vy_ + target_omega_ * PARAM.wheel_to_center) /
+    wheel_omega_setpoint_[3] =
+        (chassis_vx_setpoint_ - chassis_vy_setpoint_ +
+         chassis_omega_setpoint_ * PARAM.wheel_to_center) /
         PARAM.wheel_radius;
   }
 
@@ -454,14 +464,15 @@ class Mecanum {
       LostCtrl();
     } else {
       for (int i = 0; i < 4; i++) {
-        target_motor_current_[i] = pid_wheel_speed_[i].Calculate(
-            target_motor_omega_[i],
-            motor_feedback_[i].omega / PARAM.reduction_ratio, dt_);
+        wheel_speed_pid_output_[i] = pid_wheel_speed_[i].Calculate(
+            wheel_omega_setpoint_[i],
+            wheel_feedback_[i].omega / PARAM.reduction_ratio, dt_);
       }
       /* 计算输出 */
       for (int i = 0; i < 4; i++) {
-        output_[i] = target_motor_force_[i] * PARAM.wheel_radius +
-                     target_motor_current_[i];
+        wheel_torque_output_[i] =
+            wheel_force_setpoint_[i] * PARAM.wheel_radius +
+            wheel_speed_pid_output_[i];
       }
     }
   }
@@ -472,42 +483,43 @@ class Mecanum {
   void PowerControlUpdate() {
     /* 采样当前反馈电流和转速供功率模型参数估计使用 */
     for (int i = 0; i < 4; i++) {
-      motor_data_.rotorspeed_rpm_3508[i] = motor_feedback_[i].velocity;
+      motor_data_.rotorspeed_rpm_3508[i] = wheel_feedback_[i].velocity;
       motor_data_.output_current_3508[i] =
-          motor_feedback_[i].torque * M3508_NM_TO_LSB_RATIO;
+          wheel_feedback_[i].torque * M3508_NM_TO_LSB_RATIO;
     }
     /* 第五路是履带电机反馈 */
     motor_data_.rotorspeed_rpm_3508[4] =
-        track_motor_ == nullptr ? 0.0f : track_motor_feedback_.velocity;
+        track_motor_ == nullptr ? 0.0f : track_wheel_feedback_.velocity;
     motor_data_.output_current_3508[4] =
         track_motor_ == nullptr
             ? 0.0f
-            : track_motor_feedback_.torque * M3508_NM_TO_LSB_RATIO;
+            : track_wheel_feedback_.torque * M3508_NM_TO_LSB_RATIO;
 
     power_control_->SetMotorFeedback3508(motor_data_.output_current_3508,
                                          motor_data_.rotorspeed_rpm_3508, 5,
                                          motor_online_3508_);
 
-    float speed_error[5] = {};
+    float wheel_speed_error[5] = {};
 
     /* 写入五路期望电流供限功率使用 */
     for (int i = 0; i < 4; i++) {
-      speed_error[i] = target_motor_omega_[i] -
-                       motor_feedback_[i].omega / PARAM.reduction_ratio;
+      wheel_speed_error[i] = wheel_omega_setpoint_[i] -
+                             wheel_feedback_[i].omega / PARAM.reduction_ratio;
       motor_data_.output_current_3508[i] =
-          std::clamp(output_[i] * M3508_NM_TO_LSB_RATIO / PARAM.reduction_ratio,
+          std::clamp(wheel_torque_output_[i] * M3508_NM_TO_LSB_RATIO /
+                         PARAM.reduction_ratio,
                      -16384.0f, 16384.0f);
     }
     /* 履带线速度误差换算为主动轮角速度误差 */
-    speed_error[4] = track_speed_error_ / TRACK_WHEEL_RADIUS_M;
+    wheel_speed_error[4] = track_wheel_speed_error_ / TRACK_WHEEL_RADIUS_M;
     motor_data_.output_current_3508[4] = std::clamp(
-        track_output_current_ * static_cast<float>(M3508_MAX_ABS_LSB),
+        track_torque_output_current_ * static_cast<float>(M3508_MAX_ABS_LSB),
         -static_cast<float>(M3508_MAX_ABS_LSB),
         static_cast<float>(M3508_MAX_ABS_LSB));
 
     power_control_->SetMotorData3508(motor_data_.output_current_3508,
                                      motor_data_.rotorspeed_rpm_3508,
-                                     speed_error, 5, motor_online_3508_);
+                                     wheel_speed_error, 5, motor_online_3508_);
     PowerControl::AllocationBias3508 allocation_bias{};
     if (motor_online_3508_[4] && chassis_event_ == ChassisMode::TRACK_START) {
       const float TRACK_CMD_MAG = GetTrackCommandMagnitude();
@@ -518,14 +530,14 @@ class Mecanum {
               fabsf(track_target_speed_) * TRACK_STALL_SPEED_RATIO;
       float wheel_omega_abs_sum = 0.0f;
       for (int i = 0; i < 4; i++) {
-        wheel_omega_abs_sum += fabsf(motor_feedback_[i].omega);
+        wheel_omega_abs_sum += fabsf(wheel_feedback_[i].omega);
       }
       const bool WHEEL_FREE_SPIN =
           wheel_omega_abs_sum >
           TRACK_WHEEL_FREE_SPIN_OMEGA_RADPS * WHEEL_COUNT_FLOAT;
       const bool TRACK_NEEDS_PRIORITY =
           TRACK_ACTIVE &&
-          (fabsf(track_speed_error_) > TRACK_PRIORITY_ERROR_EPS_MPS ||
+          (fabsf(track_wheel_speed_error_) > TRACK_PRIORITY_ERROR_EPS_MPS ||
            (TRACK_STALLED && WHEEL_FREE_SPIN));
 
       allocation_bias.enabled = true;
@@ -608,15 +620,18 @@ class Mecanum {
    * 通过运动学正解算出底盘现在的运动状态，并与目标状态进行PID控制，获得目标前馈力矩
    */
   void DynamicInverseSolution() {
-    float force_x = pid_velocity_x_.Calculate(target_vx_, now_vx_, dt_);
-    float force_y = pid_velocity_y_.Calculate(target_vy_, now_vy_, dt_);
-    float force_z = pid_omega_.Calculate(target_omega_, now_omega_, dt_);
+    float force_x = pid_velocity_x_.Calculate(chassis_vx_setpoint_,
+                                              chassis_vx_feedback_, dt_);
+    float force_y = pid_velocity_y_.Calculate(chassis_vy_setpoint_,
+                                              chassis_vy_feedback_, dt_);
+    float force_z = pid_omega_.Calculate(chassis_omega_setpoint_,
+                                         chassis_omega_feedback_, dt_);
 
     /* 按麦轮受力方向分配前馈力 */
-    target_motor_force_[0] = (force_x + force_y + force_z) / 4;
-    target_motor_force_[1] = (-force_x + force_y + force_z) / 4;
-    target_motor_force_[2] = (-force_x - force_y + force_z) / 4;
-    target_motor_force_[3] = (force_x - force_y + force_z) / 4;
+    wheel_force_setpoint_[0] = (force_x + force_y + force_z) / 4;
+    wheel_force_setpoint_[1] = (-force_x + force_y + force_z) / 4;
+    wheel_force_setpoint_[2] = (-force_x - force_y + force_z) / 4;
+    wheel_force_setpoint_[3] = (force_x - force_y + force_z) / 4;
   }
 
   /**
@@ -625,19 +640,21 @@ class Mecanum {
    */
   void OutputToDynamics() {
     for (int i = 0; i < 4; i++) {
-      output_[i] = std::clamp(power_control_data_.new_output_current_3508[i] /
-                                  M3508_NM_TO_LSB_RATIO * PARAM.reduction_ratio,
-                              -6.0f, 6.0f);
+      wheel_torque_output_[i] =
+          std::clamp(power_control_data_.new_output_current_3508[i] /
+                         M3508_NM_TO_LSB_RATIO * PARAM.reduction_ratio,
+                     -6.0f, 6.0f);
     }
     if (chassis_event_ == ChassisMode::RELAX) {
       LostCtrl();
       return;
     } else {
       for (int i = 0; i < 4; i++) {
-        motor_cmd_[i].torque = std::clamp(output_[i], -6.0f, 6.0f);
+        wheel_command_[i].torque =
+            std::clamp(wheel_torque_output_[i], -6.0f, 6.0f);
       }
       for (int i = 0; i < 4; i++) {
-        motor_wheel_[i]->Control(motor_cmd_[i]);
+        motor_wheel_[i]->Control(wheel_command_[i]);
       }
     }
   }
@@ -661,8 +678,8 @@ class Mecanum {
   void CalculateTrackCurrent() {
     if (track_motor_ == nullptr || chassis_event_ != ChassisMode::TRACK_START) {
       track_target_speed_ = 0.0f;
-      track_output_current_ = 0.0f;
-      track_speed_error_ = 0.0f;
+      track_torque_output_current_ = 0.0f;
+      track_wheel_speed_error_ = 0.0f;
       return;
     }
 
@@ -671,8 +688,8 @@ class Mecanum {
     /* 目标速度加斜坡避免履带突然打满 */
     track_target_speed_ += std::clamp(DESIRED_TRACK_SPEED - track_target_speed_,
                                       -MAX_DELTA, MAX_DELTA);
-    track_speed_error_ = track_target_speed_ - track_linear_speed_;
-    track_output_current_ = pid_track_speed_.Calculate(
+    track_wheel_speed_error_ = track_target_speed_ - track_linear_speed_;
+    track_torque_output_current_ = pid_track_speed_.Calculate(
         track_target_speed_, track_linear_speed_, dt_);
   }
   void ControlTrack() {
@@ -693,12 +710,12 @@ class Mecanum {
                    -1.0f, 1.0f);
 
     /* 按麦轮相同的电流到输出轴扭矩关系下发 */
-    track_motor_cmd_.torque = std::clamp(
+    track_wheel_command_.torque = std::clamp(
         TRACK_OUTPUT_CURRENT * static_cast<float>(M3508_MAX_ABS_LSB) /
             M3508_NM_TO_LSB_RATIO * PARAM.reduction_ratio,
         -6.0f, 6.0f);
-    track_motor_cmd_.velocity = 0.0f;
-    track_motor_->Control(track_motor_cmd_);
+    track_wheel_command_.velocity = 0.0f;
+    track_motor_->Control(track_wheel_command_);
     mutex_.Unlock();
   }
   /**
@@ -830,19 +847,19 @@ class Mecanum {
 
   const ChassisParam PARAM;
 
-  float target_motor_omega_[4]{0.0f, 0.0f, 0.0f, 0.0f};
-  float target_motor_force_[4]{0.0f, 0.0f, 0.0f, 0.0f};
-  float target_motor_current_[4]{0.0f, 0.0f, 0.0f, 0.0f};
+  float wheel_omega_setpoint_[4]{0.0f, 0.0f, 0.0f, 0.0f};
+  float wheel_force_setpoint_[4]{0.0f, 0.0f, 0.0f, 0.0f};
+  float wheel_speed_pid_output_[4]{0.0f, 0.0f, 0.0f, 0.0f};
 
-  float output_[4]{0.0f, 0.0f, 0.0f, 0.0f};
+  float wheel_torque_output_[4]{0.0f, 0.0f, 0.0f, 0.0f};
 
-  float now_vx_ = 0.0f;
-  float now_vy_ = 0.0f;
-  float now_omega_ = 0.0f;
+  float chassis_vx_feedback_ = 0.0f;
+  float chassis_vy_feedback_ = 0.0f;
+  float chassis_omega_feedback_ = 0.0f;
 
-  float target_vx_ = 0.0f;
-  float target_vy_ = 0.0f;
-  float target_omega_ = 0.0f;
+  float chassis_vx_setpoint_ = 0.0f;
+  float chassis_vy_setpoint_ = 0.0f;
+  float chassis_omega_setpoint_ = 0.0f;
   float rotor_dynamic_scale_ = 1.0f; /* 功率相关动态缩放 */
 
   float current_yaw_ = 0.0f;
@@ -860,8 +877,8 @@ class Mecanum {
   Motor* motor_wheel_[4]{motor_wheel_0_, motor_wheel_1_, motor_wheel_2_,
                          motor_wheel_3_};
   bool motor_online_3508_[5]{};
-  Motor::Feedback motor_feedback_[4]{};
-  Motor::MotorCmd motor_cmd_[4]{};
+  Motor::Feedback wheel_feedback_[4]{};
+  Motor::MotorCmd wheel_command_[4]{};
   MotorData motor_data_{};
 
   LibXR::PID<float> pid_follow_;
@@ -891,10 +908,10 @@ class Mecanum {
 
   float track_linear_speed_ = 0.0f;
   float track_target_speed_ = 0.0f;
-  float track_speed_error_ = 0.0f;
-  float track_output_current_ = 0.0f;
-  Motor::Feedback track_motor_feedback_{};
-  Motor::MotorCmd track_motor_cmd_{};
+  float track_wheel_speed_error_ = 0.0f;
+  float track_torque_output_current_ = 0.0f;
+  Motor::Feedback track_wheel_feedback_{};
+  Motor::MotorCmd track_wheel_command_{};
 
   CMD* cmd_;
   CMD::ChassisCMD cmd_data_;

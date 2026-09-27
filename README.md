@@ -18,8 +18,8 @@
 底盘内部订阅的公共 topic：
 - `chassis_cmd`：CMD 发布的底盘控制命令。
 - `chassis_ref`：裁判系统底盘功率数据。
-- `gimbal_euler`：云台 IMU 融合姿态，Omni 底盘用于跟随云台 yaw。
-- `yawmotor_angle`：云台 yaw 电机角度反馈。
+- `chassis_euler`：本板 AHRS 融合姿态，Omni 取 roll/pitch 做底盘倾角重力前馈。
+- `yawmotor_angle`：云台 yaw 电机角度反馈，Omni 在 FOLLOW/ROTOR 模式下用于对齐底盘指令方向。
 
 标准命令流程：
     xrobot_add_mod Chassis --instance-id chassis

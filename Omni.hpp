@@ -13,20 +13,17 @@ depends: []
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
-#include <cstdio>
+#include <numbers>
 
 #include "CMD.hpp"
 #include "Motor.hpp"
-#include "OmniCommandContract.hpp"
 #include "PowerControl.hpp"
 #include "Referee.hpp"
 #include "app_framework.hpp"
-#include "cycle_value.hpp"
 #include "libxr_def.hpp"
 #include "libxr_time.hpp"
 #include "pid.hpp"
 #include "timebase.hpp"
-#include "timer.hpp"
 #include "transform.hpp"
 
 #define M3508_NM_TO_LSB_RATIO 52437.5f /* 3508 转子扭矩到电机控制值的比例 */
@@ -57,6 +54,12 @@ class Omni {
     float rotor_buffer_low_j = 35.0f;    /* 缓冲能量低阈值 J */
     float rotor_buffer_high_j = 70.0f;   /* 缓冲能量高阈值 J */
     float rotor_scale_lpf_alpha = 0.2f;  /* 动态缩放一阶低通系数 */
+    /* 变速小陀螺（ROTOR_VARIABLE）：扭矩域滞环参数 */
+    float spin_torque_amp_nm = 15.0f;   /* DRIVE 相底盘偏航扭矩幅值 N·m */
+    float spin_omega_hi_rad_s = 14.0f;  /* 滞环上限，进入滑行 rad/s */
+    float spin_omega_lo_rad_s = 6.0f;   /* 滞环下限，恢复驱动 rad/s */
+    float spin_omega_max_rad_s = 16.0f; /* 硬安全上限，超限强制滑行 rad/s */
+    float spin_drive_timeout_s = 2.0f;  /* 单次 DRIVE 相最长时间 s */
   };
   enum class ChassisMode : uint8_t {
     RELAX,
@@ -64,6 +67,7 @@ class Omni {
     ROTOR,
     FOLLOW,
     NAVIGATION,
+    ROTOR_VARIABLE, /* 变速小陀螺：扭矩域滞环（追加尾部，线值=5） */
   };
 
   /**
@@ -117,23 +121,24 @@ class Omni {
        LibXR::PID<float>::Param pid_steer_speed_3,
        LibXR::Thread::Priority thread_priority = LibXR::Thread::Priority::HIGH)
       : PARAM(chassis_param),
-        motor_wheel_0_(motor_wheel_0),   /* wheel0   ▲ y  wheel3 */
-        motor_wheel_1_(motor_wheel_1),   /*     ↙    │     ↖     */
-        motor_wheel_2_(motor_wheel_2),   /*          │           */
-        motor_wheel_3_(motor_wheel_3),   /* ─────────┼────────▶x */
-        pid_follow_(pid_follow),         /*          │           */
-        pid_velocity_x_(pid_velocity_x), /*     ↘    │     ↗     */
-        pid_velocity_y_(pid_velocity_y), /* wheel1   │    wheel2 */
+        /* 电机布局：
+         *  wheel0   ▲ y  wheel3
+         *      ↙    │     ↖
+         *           │
+         *  ─────────┼────────▶x
+         *           │
+         *      ↘    │     ↗
+         *  wheel1   │    wheel2 */
+        wheel_{.motor = {motor_wheel_0, motor_wheel_1, motor_wheel_2,
+                         motor_wheel_3}},
+        pid_follow_(pid_follow),
+        pid_velocity_x_(pid_velocity_x),
+        pid_velocity_y_(pid_velocity_y),
         pid_omega_(pid_omega),
         pid_wheel_speed_{pid_wheel_speed_0, pid_wheel_speed_1,
                          pid_wheel_speed_2, pid_wheel_speed_3},
-        pid_steer_angle_{pid_steer_angle_0, pid_steer_angle_1,
-                         pid_steer_angle_2, pid_steer_angle_3},
-        pid_steer_speed_{pid_steer_speed_0, pid_steer_speed_1,
-                         pid_steer_speed_2, pid_steer_speed_3},
         cmd_(cmd),
-        power_control_(power_control),
-        referee_(referee) {
+        power_control_(power_control) {
     UNUSED(hw);
     UNUSED(app);
     UNUSED(motor_steer_0);
@@ -150,23 +155,19 @@ class Omni {
     UNUSED(pid_steer_angle_3);
 
     for (int i = 0; i < 4; i++) {
-      motor_cmd_[i].mode = Motor::ControlMode::MODE_TORQUE;
-      motor_cmd_[i].reduction_ratio = chassis_param.reduction_ratio;
-      motor_cmd_[i].torque = 0.0f;
-      motor_cmd_[i].position = 0.0f;
-      motor_cmd_[i].velocity = 0.0f;
-      motor_cmd_[i].kp = 0.0f;
-      motor_cmd_[i].kd = 0.0f;
+      wheel_.command[i].mode = Motor::ControlMode::MODE_TORQUE;
+      wheel_.command[i].reduction_ratio = chassis_param.reduction_ratio;
+      wheel_.command[i].torque = 0.0f;
+      wheel_.command[i].position = 0.0f;
+      wheel_.command[i].velocity = 0.0f;
+      wheel_.command[i].kp = 0.0f;
+      wheel_.command[i].kd = 0.0f;
     }
 
     thread_.Create(this, ThreadFunction, "OmniChassisThread", task_stack_depth,
                    thread_priority);
-    if (referee_ != nullptr) {
-      /* 底盘裁判系统 UI 由 Omni 自己的定时器任务周期刷新 */
-      timer_ui_ = LibXR::Timer::CreateTask(DrawUI, this, UI_REFRESH_PERIOD_MS);
-      LibXR::Timer::Add(timer_ui_);
-      LibXR::Timer::Start(timer_ui_);
-    }
+    /* 本底盘类型无裁判系统 UI，referee 参数仅为与共享外壳签名一致而保留 */
+    UNUSED(referee);
 
     auto start_ctrl_callback = LibXR::Callback<uint32_t>::Create(
         [](bool in_isr, Omni* omni, uint32_t event_id) {
@@ -174,7 +175,6 @@ class Omni {
           UNUSED(event_id);
           omni->mutex_.Lock();
           omni->chassis_event_ = ChassisMode::RELAX;
-          ResetModeUILocked(omni);
           omni->mutex_.Unlock();
         },
         this);
@@ -186,7 +186,6 @@ class Omni {
           omni->mutex_.Lock();
           omni->chassis_event_ = ChassisMode::RELAX;
           omni->LostCtrl();
-          ResetModeUILocked(omni);
           omni->mutex_.Unlock();
         },
         this);
@@ -206,17 +205,18 @@ class Omni {
     LibXR::Topic::ASyncSubscriber<CMD::ChassisCMD> cmd_suber("chassis_cmd");
     LibXR::Topic::ASyncSubscriber<Referee::ChassisPack> referee_suber(
         "chassis_ref");
-    LibXR::Topic::ASyncSubscriber<LibXR::EulerAngle<float>> euler_suber(
-        "gimbal_euler");
+    /* 底盘倾角直接取自本板 AHRS，不再跨板取云台板 IMU 姿态做反推 */
+    LibXR::Topic::ASyncSubscriber<LibXR::EulerAngle<float>> chassis_euler_suber(
+        "chassis_euler");
+    LibXR::Topic::ASyncSubscriber<Eigen::Matrix<float, 3, 1>> gyro_suber(
+        "chassis_gyro");
     LibXR::Topic::ASyncSubscriber<float> yawmotor_angle_suber("yawmotor_angle");
-    LibXR::Topic::ASyncSubscriber<float> pitchmotor_angle_suber(
-        "pitchmotor_angle");
 
     cmd_suber.StartWaiting();
     referee_suber.StartWaiting();
-    euler_suber.StartWaiting();
+    chassis_euler_suber.StartWaiting();
     yawmotor_angle_suber.StartWaiting();
-    pitchmotor_angle_suber.StartWaiting();
+    gyro_suber.StartWaiting();
     omni->last_online_time_ = LibXR::Timebase::GetMicroseconds();
     auto last_time = LibXR::Timebase::GetMilliseconds();
     omni->mutex_.Unlock();
@@ -232,21 +232,19 @@ class Omni {
         referee_suber.StartWaiting();
       }
 
-      if (euler_suber.Available()) {
-        omni->euler_ = euler_suber.GetData();
-        euler_suber.StartWaiting();
-        omni->imu_pitch_ = -(omni->euler_.Pitch());
-        omni->imu_roll_ = -(omni->euler_.Roll());
-        omni->imu_yaw_ = (omni->euler_.Yaw());
+      if (chassis_euler_suber.Available()) {
+        omni->motion_.euler = chassis_euler_suber.GetData();
+        chassis_euler_suber.StartWaiting();
       }
 
       if (yawmotor_angle_suber.Available()) {
-        omni->yawmotor_angle_ = yawmotor_angle_suber.GetData();
+        omni->motion_.yawmotor_angle = yawmotor_angle_suber.GetData();
         yawmotor_angle_suber.StartWaiting();
       }
-      if (pitchmotor_angle_suber.Available()) {
-        omni->pitchmotor_angle_ = pitchmotor_angle_suber.GetData();
-        pitchmotor_angle_suber.StartWaiting();
+      if (gyro_suber.Available()) {
+        omni->motion_.gyro_wz = gyro_suber.GetData().z();
+        omni->last_gyro_time_ = LibXR::Timebase::GetMicroseconds();
+        gyro_suber.StartWaiting();
       }
       omni->mutex_.Lock();
       omni->Update();
@@ -275,10 +273,16 @@ class Omni {
 
     for (int i = 0; i < 4; i++) {
       const bool WHEEL_UPDATE_OK =
-          motor_wheel_[i]->Update() == LibXR::ErrorCode::OK;
-      motor_feedback_[i] = motor_wheel_[i]->GetFeedback();
-      motor_online_3508_[i] = WHEEL_UPDATE_OK && motor_feedback_[i].state != 0U;
+          wheel_.motor[i]->Update() == LibXR::ErrorCode::OK;
+      wheel_.feedback[i] = wheel_.motor[i]->GetFeedback();
+      wheel_.online[i] = WHEEL_UPDATE_OK && wheel_.feedback[i].state != 0U;
     }
+  }
+
+  /** @brief 在互斥保护下读取实际模式，供双板链路确认切换结果。 */
+  ChassisMode GetMode() {
+    LibXR::Mutex::LockGuard lock(mutex_);
+    return chassis_event_;
   }
 
   /**
@@ -289,14 +293,14 @@ class Omni {
     mutex_.Lock();
     const ChassisMode NEXT_MODE = static_cast<ChassisMode>(mode);
     chassis_event_ = NEXT_MODE;
-    ui_text_initialized_ = false;
-    ui_refresh_tick_ = UI_MODE_TEXT_TICK;
     pid_omega_.Reset();
     pid_velocity_x_.Reset();
     pid_velocity_y_.Reset();
     for (int i = 0; i < 4; i++) {
       pid_wheel_speed_[i].Reset();
     }
+    spin_.driving = false;
+    spin_.tau_cmd = 0.0f;
     mutex_.Unlock();
   }
 
@@ -309,52 +313,62 @@ class Omni {
         PARAM.wheel_radius * static_cast<float>(OMNI_MOTOR_MAX_OMEGA);
 
     if (cmd_data_.source == CMD::ChassisCommandSource::NAVIGATION) {
-      target_vx_ = cmd_data_.navigation_velocity.vx_mps;
-      target_vy_ = cmd_data_.navigation_velocity.vy_mps;
+      /* 导航来源的速度已是物理量且已在主机侧旋到车体系，直接整组取用 */
+      motion_.setpoint = cmd_data_.navigation_velocity;
       switch (chassis_event_) {
         case ChassisMode::RELAX:
-          target_vx_ = 0.0F;
-          target_vy_ = 0.0F;
-          target_omega_ = 0.0F;
+          motion_.setpoint.vx_mps = 0.0F;
+          motion_.setpoint.vy_mps = 0.0F;
+          motion_.setpoint.wz_rad_s = 0.0F;
           break;
         case ChassisMode::NAVIGATION:
-          target_omega_ = cmd_data_.navigation_velocity.wz_rad_s;
+          motion_.setpoint.wz_rad_s = 0.0F;
           break;
         case ChassisMode::ROTOR:
-          target_omega_ = -static_cast<float>(max_v / PARAM.wheel_to_center);
+          motion_.setpoint.wz_rad_s =
+              -static_cast<float>(max_v / PARAM.wheel_to_center);
           break;
         case ChassisMode::FOLLOW:
-          target_omega_ = -pid_follow_.Calculate(0.0f, yawmotor_angle_, dt_);
+          motion_.setpoint.wz_rad_s =
+              -pid_follow_.Calculate(0.0f, motion_.yawmotor_angle, dt_);
           break;
         default:
-          target_vx_ = 0.0F;
-          target_vy_ = 0.0F;
-          target_omega_ = 0.0F;
+          motion_.setpoint.vx_mps = 0.0F;
+          motion_.setpoint.vy_mps = 0.0F;
+          motion_.setpoint.wz_rad_s = 0.0F;
           break;
       }
     } else {
       /* 先生成目标角速度 */
       switch (chassis_event_) {
         case ChassisMode::RELAX:
-          target_omega_ = 0.0f;
+          motion_.setpoint.wz_rad_s = 0.0f;
           break;
 
         case ChassisMode::INDEPENDENT:
-          target_omega_ =
+          motion_.setpoint.wz_rad_s =
               max_v * cmd_data_.operator_input.z / PARAM.wheel_to_center;
           break;
 
+        /* 扭矩域：速度由积分自然形成，速度设定占位为 0，
+         * 旋转分量在逆运动学处改用实测值回填 */
+        case ChassisMode::ROTOR_VARIABLE:
+          motion_.setpoint.wz_rad_s = 0.0f;
+          break;
+
         case ChassisMode::ROTOR:
-          target_omega_ = -static_cast<float>(max_v / PARAM.wheel_to_center);
+          motion_.setpoint.wz_rad_s =
+              -static_cast<float>(max_v / PARAM.wheel_to_center);
           break;
 
           /* 正方向跟随云台 */
         case ChassisMode::FOLLOW:
-          target_omega_ = -pid_follow_.Calculate(0.0f, yawmotor_angle_, dt_);
+          motion_.setpoint.wz_rad_s =
+              -pid_follow_.Calculate(0.0f, motion_.yawmotor_angle, dt_);
           break;
 
         case ChassisMode::NAVIGATION:
-          target_omega_ = 0.0F;
+          motion_.setpoint.wz_rad_s = 0.0F;
           break;
 
         default:
@@ -364,31 +378,33 @@ class Omni {
       /* 再生成目标平移速度 */
       switch (chassis_event_) {
         case ChassisMode::RELAX:
-          target_vx_ = 0.0f;
-          target_vy_ = 0.0f;
+          motion_.setpoint.vx_mps = 0.0f;
+          motion_.setpoint.vy_mps = 0.0f;
           break;
         case ChassisMode::ROTOR:
+        case ChassisMode::ROTOR_VARIABLE:
         case ChassisMode::FOLLOW: {
-          float beta = yawmotor_angle_;
+          float beta = motion_.yawmotor_angle;
           float cos_beta = cosf(beta);
           float sin_beta = sinf(beta);
-          target_vx_ = (cos_beta * cmd_data_.operator_input.x * max_v -
-                        sin_beta * cmd_data_.operator_input.y * max_v);
-          target_vy_ = (sin_beta * cmd_data_.operator_input.x * max_v +
-                        cos_beta * cmd_data_.operator_input.y * max_v);
+          motion_.setpoint.vx_mps =
+              (cos_beta * cmd_data_.operator_input.x * max_v -
+               sin_beta * cmd_data_.operator_input.y * max_v);
+          motion_.setpoint.vy_mps =
+              (sin_beta * cmd_data_.operator_input.x * max_v +
+               cos_beta * cmd_data_.operator_input.y * max_v);
         } break;
         case ChassisMode::INDEPENDENT: {
-          const float SQRT2 = 1.41421356237f;
           /* 独立模式用菱形限幅适配摇杆边界 */
           float s = fabsf(cmd_data_.operator_input.x) +
                     fabsf(cmd_data_.operator_input.y);
           float k = (s <= 1.0f) ? max_v : (max_v / s);
-          target_vx_ = SQRT2 * k * cmd_data_.operator_input.x;
-          target_vy_ = SQRT2 * k * cmd_data_.operator_input.y;
+          motion_.setpoint.vx_mps = SQRT2 * k * cmd_data_.operator_input.x;
+          motion_.setpoint.vy_mps = SQRT2 * k * cmd_data_.operator_input.y;
         } break;
         case ChassisMode::NAVIGATION:
-          target_vx_ = 0.0F;
-          target_vy_ = 0.0F;
+          motion_.setpoint.vx_mps = 0.0F;
+          motion_.setpoint.vy_mps = 0.0F;
           break;
         default:
           break;
@@ -399,7 +415,8 @@ class Omni {
     float rotor_translation_scale = 1.0f;
     if (chassis_event_ == ChassisMode::ROTOR) {
       float translation_magnitude =
-          sqrtf(target_vx_ * target_vx_ + target_vy_ * target_vy_);
+          sqrtf(motion_.setpoint.vx_mps * motion_.setpoint.vx_mps +
+                motion_.setpoint.vy_mps * motion_.setpoint.vy_mps);
       float translation_ratio = 0.0f;
       if (max_v > 1e-3f) {
         translation_ratio =
@@ -407,7 +424,8 @@ class Omni {
       }
       rotor_translation_scale =
           1.0f - (1.0f - PARAM.rotor_speed_scale) * translation_ratio;
-      target_omega_ *= rotor_translation_scale * rotor_dynamic_scale_;
+      motion_.setpoint.wz_rad_s *=
+          rotor_translation_scale * motion_.rotor_dynamic_scale;
     }
   }
 
@@ -443,65 +461,49 @@ class Omni {
 
   /**
    * @brief 计算姿态前馈
+   * @details 底盘倾角直接取自本板 AHRS（`chassis_euler`），无需再借云台板 IMU
+   *          姿态与云台关节角做跨板反推，也不再做反号适配。
+   *          所有中间量（GX_FF/GY_FF/PX/PY/length 等）均为本函数局部量，
+   *          每周期从 `motion_.euler` 与 PARAM 重新推导，结果直写
+   *          `output_.feedforward_torque`。
+   * @warning gx/gy/px/py 的符号由此处的符号约定决定。当前
+   *          `sentry_chassis.yaml` 的 gravity 与 gravity_height 均为 0，前馈
+   *          输出恒为 0，符号变更不可观测；填入实车值前必须先确认符号。
    */
   void FeedForward() {
-    const auto wrap_to_pi = [](float angle) {
-      return LibXR::CycleValue<float>(angle) - 0.0f;
-    };
+    /* 四个轮位相对车体中心的坐标，只由几何参数决定 */
+    const float HALF_WIDTH = PARAM.width / 2;
+    const float HALF_LENGTH = PARAM.length / 2;
+    const float POST_X[4] = {-HALF_WIDTH, -HALF_WIDTH, HALF_WIDTH, HALF_WIDTH};
+    const float POST_Y[4] = {HALF_LENGTH, -HALF_LENGTH, -HALF_LENGTH,
+                             HALF_LENGTH};
 
-    post_x_[0] = -PARAM.width / 2;
-    post_x_[1] = -PARAM.width / 2;
-    post_x_[2] = PARAM.width / 2;
-    post_x_[3] = PARAM.width / 2;
+    const float K = static_cast<float>(LibXR::PI / 50.0);
+    const float GY_FF =
+        -PARAM.gravity * SoftDeadzone(sinf(motion_.euler.Pitch()), sinf(K));
+    const float GX_FF =
+        -PARAM.gravity * SoftDeadzone(sinf(motion_.euler.Roll()), sinf(K));
+    const float PY = -PARAM.gravity_height *
+                     SoftDeadzone(sinf(motion_.euler.Pitch()), sin(K));
+    const float PX = -PARAM.gravity_height *
+                     SoftDeadzone(sinf(motion_.euler.Roll()), sin(K));
 
-    post_y_[0] = PARAM.length / 2;
-    post_y_[1] = -PARAM.length / 2;
-    post_y_[2] = -PARAM.length / 2;
-    post_y_[3] = PARAM.length / 2;
+    const float DIR[4] = {GX_FF + GY_FF, -GX_FF + GY_FF, -GX_FF - GY_FF,
+                          GX_FF - GY_FF};
 
-    const LibXR::RotationMatrix<float> R_wg(
-        LibXR::EulerAngle<float>(wrap_to_pi(imu_roll_), wrap_to_pi(imu_pitch_),
-                                 wrap_to_pi(imu_yaw_))
-            .ToRotationMatrixZYX());
-    const LibXR::RotationMatrix<float> R_cg(
-        LibXR::EulerAngle<float>(0.0f, wrap_to_pi(pitchmotor_angle_),
-                                 wrap_to_pi(yawmotor_angle_))
-            .ToRotationMatrixZYX());
-    const LibXR::RotationMatrix<float> R_gc(-R_cg);
-    const LibXR::RotationMatrix<float> R_wc = R_wg * R_gc;
-
-    const float val = std::clamp(static_cast<float>(-R_wc(2, 0)), -1.0f, 1.0f);
-    chassis_pitch_ = wrap_to_pi(asinf(val));
-    chassis_roll_ = wrap_to_pi(atan2f(R_wc(2, 1), R_wc(2, 2)));
-
-    float k = static_cast<float>(LibXR::PI / 50.0);
-    gy_ff_ = -PARAM.gravity * SoftDeadzone(sinf(chassis_pitch_), sinf(k));
-    gx_ff_ = -PARAM.gravity * SoftDeadzone(sinf(chassis_roll_), sinf(k));
-
-    py = -PARAM.gravity_height * SoftDeadzone(sinf(chassis_pitch_), sin(k));
-    px = -PARAM.gravity_height * SoftDeadzone(sinf(chassis_roll_), sin(k));
-
+    float length[4];
+    float length_inv_sum = 0.0f;
     for (int i = 0; i < 4; i++) {
-      float dx = post_x_[i] - px;
-      float dy = post_y_[i] - py;
-      length_[i] = sqrtf(dx * dx + dy * dy);
-    }
-
-    const float SQRT2 = 0.70710678118f * 2;
-    baseff_[0] = (gx_ff_ + gy_ff_) * SQRT2;
-    baseff_[1] = (-gx_ff_ + gy_ff_) * SQRT2;
-    baseff_[2] = (-gx_ff_ - gy_ff_) * SQRT2;
-    baseff_[3] = (gx_ff_ - gy_ff_) * SQRT2;
-
-    for (int i = 0; i < 4; i++) {
-      baseff_l_[i] = 1.0f / length_[i];
-      torque_n_[i] = baseff_l_[i] / (baseff_l_[0] + baseff_l_[1] +
-                                     baseff_l_[2] + baseff_l_[3]);
-      baseff_[i] = baseff_[i] * torque_n_[i];
+      const float DX = POST_X[i] - PX;
+      const float DY = POST_Y[i] - PY;
+      length[i] = sqrtf(DX * DX + DY * DY);
+      length_inv_sum += 1.0f / length[i];
     }
 
     for (int i = 0; i < 4; i++) {
-      torque_ff_[i] = baseff_[i] * PARAM.wheel_radius;
+      const float TORQUE_N = (1.0f / length[i]) / length_inv_sum;
+      output_.feedforward_torque[i] =
+          DIR[i] * SQRT2 * TORQUE_N * PARAM.wheel_radius;
     }
   }
 
@@ -510,25 +512,26 @@ class Omni {
    * @details 根据四个全向轮的角速度，解算出底盘当前的运动状态
    */
   void SelfResolution() {
-    const float SQRT2 = 1.41421356237f;
+    motion_.measured.vx_mps =
+        -(wheel_.feedback[0].omega / PARAM.reduction_ratio -
+          wheel_.feedback[1].omega / PARAM.reduction_ratio -
+          wheel_.feedback[2].omega / PARAM.reduction_ratio +
+          wheel_.feedback[3].omega / PARAM.reduction_ratio) *
+        SQRT2 * PARAM.wheel_radius / 4.0f;
 
-    now_vx_ = -(motor_feedback_[0].omega / PARAM.reduction_ratio -
-                motor_feedback_[1].omega / PARAM.reduction_ratio -
-                motor_feedback_[2].omega / PARAM.reduction_ratio +
-                motor_feedback_[3].omega / PARAM.reduction_ratio) *
-              SQRT2 * PARAM.wheel_radius / 4.0f;
+    motion_.measured.vy_mps =
+        -(wheel_.feedback[0].omega / PARAM.reduction_ratio +
+          wheel_.feedback[1].omega / PARAM.reduction_ratio -
+          wheel_.feedback[2].omega / PARAM.reduction_ratio -
+          wheel_.feedback[3].omega / PARAM.reduction_ratio) *
+        SQRT2 * PARAM.wheel_radius / 4.0f;
 
-    now_vy_ = -(motor_feedback_[0].omega / PARAM.reduction_ratio +
-                motor_feedback_[1].omega / PARAM.reduction_ratio -
-                motor_feedback_[2].omega / PARAM.reduction_ratio -
-                motor_feedback_[3].omega / PARAM.reduction_ratio) *
-              SQRT2 * PARAM.wheel_radius / 4.0f;
-
-    now_omega_ = (motor_feedback_[0].omega / PARAM.reduction_ratio +
-                  motor_feedback_[1].omega / PARAM.reduction_ratio +
-                  motor_feedback_[2].omega / PARAM.reduction_ratio +
-                  motor_feedback_[3].omega / PARAM.reduction_ratio) *
-                 PARAM.wheel_radius / (4.0f * PARAM.wheel_to_center);
+    motion_.measured.wz_rad_s =
+        (wheel_.feedback[0].omega / PARAM.reduction_ratio +
+         wheel_.feedback[1].omega / PARAM.reduction_ratio +
+         wheel_.feedback[2].omega / PARAM.reduction_ratio +
+         wheel_.feedback[3].omega / PARAM.reduction_ratio) *
+        PARAM.wheel_radius / (4.0f * PARAM.wheel_to_center);
   }
 
   /**
@@ -536,21 +539,25 @@ class Omni {
    * @details 根据目标底盘速度（vx, vy, ω），计算四个全向轮的目标角速度
    */
   void InverseKinematicsSolution() {
-    const auto TARGETS = Pldx::OmniCommandContract::Resolve(
-        target_vx_, target_vy_, target_omega_, PARAM.wheel_radius,
-        PARAM.wheel_to_center);
-    if (!TARGETS.valid) {
-      chassis_event_ = ChassisMode::RELAX;
-      target_vx_ = target_vy_ = target_omega_ = 0.0F;
-      for (float& target : target_motor_omega_) target = 0.0F;
-      return;
-    }
-    target_vx_ *= TARGETS.scale;
-    target_vy_ *= TARGETS.scale;
-    target_omega_ *= TARGETS.scale;
-    for (size_t index = 0U; index < TARGETS.angular_velocity.size(); ++index) {
-      target_motor_omega_[index] = TARGETS.angular_velocity[index];
-    }
+    const float VX = motion_.setpoint.vx_mps;
+    const float VY = motion_.setpoint.vy_mps;
+    /* 扭矩域无旋转速度设定：旋转分量按实测回填，
+     * 使轮速误差仅反映平移需求（功率分配语义正确） */
+    const float WZ = (chassis_event_ == ChassisMode::ROTOR_VARIABLE)
+                         ? motion_.measured.wz_rad_s
+                         : motion_.setpoint.wz_rad_s;
+    output_.omega_setpoint[0] =
+        (-INV_SQRT2 * VX - INV_SQRT2 * VY + WZ * PARAM.wheel_to_center) /
+        PARAM.wheel_radius;
+    output_.omega_setpoint[1] =
+        (INV_SQRT2 * VX - INV_SQRT2 * VY + WZ * PARAM.wheel_to_center) /
+        PARAM.wheel_radius;
+    output_.omega_setpoint[2] =
+        (INV_SQRT2 * VX + INV_SQRT2 * VY + WZ * PARAM.wheel_to_center) /
+        PARAM.wheel_radius;
+    output_.omega_setpoint[3] =
+        (-INV_SQRT2 * VX + INV_SQRT2 * VY + WZ * PARAM.wheel_to_center) /
+        PARAM.wheel_radius;
   }
 
   /**
@@ -559,19 +566,29 @@ class Omni {
   void CalculateMotorCurrent() {
     if (chassis_event_ == ChassisMode::RELAX) {
       LostCtrl();
-    } else {
-      /* 轮速 PID 输出 */
+    } else if (chassis_event_ == ChassisMode::ROTOR_VARIABLE) {
+      /* 扭矩域：无轮速闭环（与扭矩波形互斥），力设定 + 倾角前馈直通；
+       * 滑行相力设定为 0 → 请求电流≈0，摩擦自然减速 */
       for (int i = 0; i < 4; i++) {
-        target_motor_current_[i] = pid_wheel_speed_[i].Calculate(
-            target_motor_omega_[i],
-            motor_feedback_[i].omega / PARAM.reduction_ratio, dt_);
+        output_.torque_output[i] =
+            output_.force_setpoint[i] * PARAM.wheel_radius +
+            output_.feedforward_torque[i];
+      }
+    } else {
+      /* 轮速 PID 输出（仅本函数写读，局部化，不入实例） */
+      float speed_pid_output[4];
+      for (int i = 0; i < 4; i++) {
+        speed_pid_output[i] = pid_wheel_speed_[i].Calculate(
+            output_.omega_setpoint[i],
+            wheel_.feedback[i].omega / PARAM.reduction_ratio, dt_);
       }
 
       /* 合成动力学输出和上坡前馈 */
       for (int i = 0; i < 4; i++) {
-        output_[i] = target_motor_force_[i] * PARAM.wheel_radius +
-                     target_motor_current_[i] + torque_ff_[i] +
-                     ResistanceTorque(target_motor_omega_[i]);
+        output_.torque_output[i] =
+            output_.force_setpoint[i] * PARAM.wheel_radius +
+            speed_pid_output[i] + output_.feedforward_torque[i] +
+            ResistanceTorque(output_.omega_setpoint[i]);
       }
     }
   }
@@ -581,40 +598,41 @@ class Omni {
    */
   void PowerControlUpdate() {
     for (int i = 0; i < 4; i++) {
-      motor_data_.rotorspeed_rpm_3508[i] = motor_feedback_[i].velocity;
-      motor_data_.output_current_3508[i] =
-          motor_feedback_[i].torque * M3508_NM_TO_LSB_RATIO;
+      power_.motor_data_.rotorspeed_rpm_3508[i] = wheel_.feedback[i].velocity;
+      power_.motor_data_.output_current_3508[i] =
+          wheel_.feedback[i].torque * M3508_NM_TO_LSB_RATIO;
     }
 
-    power_control_->SetMotorFeedback3508(motor_data_.output_current_3508,
-                                         motor_data_.rotorspeed_rpm_3508, 4,
-                                         motor_online_3508_);
+    power_control_->SetMotorFeedback3508(power_.motor_data_.output_current_3508,
+                                         power_.motor_data_.rotorspeed_rpm_3508,
+                                         4, wheel_.online);
 
-    float speed_error[4];
+    float wheel_speed_error[4];
     for (int i = 0; i < 4; i++) {
-      speed_error[i] = target_motor_omega_[i] -
-                       motor_feedback_[i].omega / PARAM.reduction_ratio;
-      motor_data_.output_current_3508[i] =
-          std::clamp(output_[i] * M3508_NM_TO_LSB_RATIO / PARAM.reduction_ratio,
+      wheel_speed_error[i] = output_.omega_setpoint[i] -
+                             wheel_.feedback[i].omega / PARAM.reduction_ratio;
+      power_.motor_data_.output_current_3508[i] =
+          std::clamp(output_.torque_output[i] * M3508_NM_TO_LSB_RATIO /
+                         PARAM.reduction_ratio,
                      -16384.0f, 16384.0f);
     }
 
-    power_control_->SetMotorData3508(motor_data_.output_current_3508,
-                                     motor_data_.rotorspeed_rpm_3508,
-                                     speed_error, 4, motor_online_3508_);
+    power_control_->SetMotorData3508(power_.motor_data_.output_current_3508,
+                                     power_.motor_data_.rotorspeed_rpm_3508,
+                                     wheel_speed_error, 4, wheel_.online);
 
     power_control_->SetBoostRequested(cmd_data_.self_define ==
                                       CMD::ChasStat::BOOST);
     power_control_->OutputLimit();
-    power_control_data_ = power_control_->GetPowerControlData();
+    power_.limited = power_control_->GetPowerControlData();
 
     float req_current_abs_sum = 0.0f;
     float lim_current_abs_sum = 0.0f;
     for (int i = 0; i < 4; i++) {
-      float req_current_abs = fabsf(motor_data_.output_current_3508[i]);
+      float req_current_abs = fabsf(power_.motor_data_.output_current_3508[i]);
       float lim_current_abs =
-          power_control_data_.is_power_limited
-              ? fabsf(power_control_data_.new_output_current_3508[i])
+          power_.limited.is_power_limited
+              ? fabsf(power_.limited.new_output_current_3508[i])
               : req_current_abs;
       req_current_abs_sum += req_current_abs;
       lim_current_abs_sum += lim_current_abs;
@@ -627,7 +645,7 @@ class Omni {
     }
 
     float buffer_scale = 1.0f;
-    if (power_control_data_.referee_energy_buffer_online) {
+    if (power_.limited.referee_energy_buffer_online) {
       float buffer_range =
           std::max(PARAM.rotor_buffer_high_j - PARAM.rotor_buffer_low_j, 1.0f);
       float referee_buffer_j =
@@ -640,20 +658,52 @@ class Omni {
     }
 
     float limit_scale =
-        power_control_data_.is_power_limited
+        power_.limited.is_power_limited
             ? std::clamp(power_limit_ratio, PARAM.rotor_omega_min_scale, 1.0f)
             : 1.0f;
     float target_dynamic_scale = std::clamp(buffer_scale * limit_scale,
                                             PARAM.rotor_omega_min_scale, 1.0f);
     float lpf_alpha = std::clamp(PARAM.rotor_scale_lpf_alpha, 0.0f, 1.0f);
-    rotor_dynamic_scale_ +=
-        (target_dynamic_scale - rotor_dynamic_scale_) * lpf_alpha;
-    rotor_dynamic_scale_ =
-        std::clamp(rotor_dynamic_scale_, PARAM.rotor_omega_min_scale, 1.0f);
+    motion_.rotor_dynamic_scale +=
+        (target_dynamic_scale - motion_.rotor_dynamic_scale) * lpf_alpha;
+    motion_.rotor_dynamic_scale = std::clamp(motion_.rotor_dynamic_scale,
+                                             PARAM.rotor_omega_min_scale, 1.0f);
 
-    if (chassis_event_ != ChassisMode::ROTOR) {
-      rotor_dynamic_scale_ = 1.0f;
+    if (chassis_event_ != ChassisMode::ROTOR &&
+        chassis_event_ != ChassisMode::ROTOR_VARIABLE) {
+      motion_.rotor_dynamic_scale = 1.0f;
     }
+  }
+
+  /**
+   * @brief 变速小陀螺扭矩波形机（滞环：恒扭矩驱动 / 零扭矩滑行）
+   * @details 扭矩域控制，速度是力的积分，不做连续速度闭环。
+   *          ω 优先取本板 IMU 陀螺 z（轮速里程计在打滑时失真），
+   *          陀螺 100 ms 未更新则回退正解算值。转向与现有 ROTOR 一致（负向）。
+   */
+  void UpdateSpinCommand() {
+    const auto NOW = LibXR::Timebase::GetMicroseconds();
+    const float OMEGA_MEASURED = (NOW - last_gyro_time_ < 100000)
+                                     ? motion_.gyro_wz
+                                     : motion_.measured.wz_rad_s;
+    const float OMEGA_ABS = fabsf(OMEGA_MEASURED);
+
+    if (spin_.driving) {
+      if (OMEGA_ABS >= PARAM.spin_omega_hi_rad_s ||
+          OMEGA_ABS > PARAM.spin_omega_max_rad_s ||
+          NOW - spin_.phase_start_us >=
+              static_cast<LibXR::MicrosecondTimestamp>(
+                  PARAM.spin_drive_timeout_s * 1.0e6f)) {
+        spin_.driving = false; /* 到上限/超硬限/超时 → 滑行 */
+      }
+    } else {
+      if (OMEGA_ABS <= PARAM.spin_omega_lo_rad_s) {
+        spin_.driving = true; /* 降到下限 → 恒扭矩驱动 */
+        spin_.phase_start_us = NOW;
+      }
+    }
+
+    spin_.tau_cmd = spin_.driving ? -PARAM.spin_torque_amp_nm : 0.0f;
   }
 
   /**
@@ -662,17 +712,31 @@ class Omni {
    * 通过运动学正解算出底盘现在的运动状态，并与目标状态进行PID控制，获得目标前馈力矩
    */
   void DynamicInverseSolution() {
-    const float SQRT2 = 1.41421356237f;
+    const float FORCE_X = pid_velocity_x_.Calculate(
+        motion_.setpoint.vx_mps, motion_.measured.vx_mps, dt_);
+    const float FORCE_Y = pid_velocity_y_.Calculate(
+        motion_.setpoint.vy_mps, motion_.measured.vy_mps, dt_);
 
-    const float FORCE_X = pid_velocity_x_.Calculate(target_vx_, now_vx_, dt_);
-    const float FORCE_Y = pid_velocity_y_.Calculate(target_vy_, now_vy_, dt_);
-    const float FORCE_Z = pid_omega_.Calculate(target_omega_, now_omega_, dt_);
+    /* 扭矩域：跳过 pid_omega_（速度环与扭矩波形互斥），
+     * FORCE_Z 由波形机直接给定；速度域：pid_omega_ 闭环 */
+    float force_z;
+    if (chassis_event_ == ChassisMode::ROTOR_VARIABLE) {
+      UpdateSpinCommand();
+      force_z = spin_.tau_cmd / PARAM.wheel_to_center;
+    } else {
+      force_z = pid_omega_.Calculate(motion_.setpoint.wz_rad_s,
+                                     motion_.measured.wz_rad_s, dt_);
+    }
 
     /* 按全向轮受力方向分配前馈力 */
-    target_motor_force_[0] = (-SQRT2 * FORCE_X - SQRT2 * FORCE_Y + FORCE_Z) / 4;
-    target_motor_force_[1] = (SQRT2 * FORCE_X - SQRT2 * FORCE_Y + FORCE_Z) / 4;
-    target_motor_force_[2] = (SQRT2 * FORCE_X + SQRT2 * FORCE_Y + FORCE_Z) / 4;
-    target_motor_force_[3] = (-SQRT2 * FORCE_X + SQRT2 * FORCE_Y + FORCE_Z) / 4;
+    output_.force_setpoint[0] =
+        (-SQRT2 * FORCE_X - SQRT2 * FORCE_Y + force_z) / 4;
+    output_.force_setpoint[1] =
+        (SQRT2 * FORCE_X - SQRT2 * FORCE_Y + force_z) / 4;
+    output_.force_setpoint[2] =
+        (SQRT2 * FORCE_X + SQRT2 * FORCE_Y + force_z) / 4;
+    output_.force_setpoint[3] =
+        (-SQRT2 * FORCE_X + SQRT2 * FORCE_Y + force_z) / 4;
   }
 
   /**
@@ -681,19 +745,21 @@ class Omni {
    */
   void OutputToDynamics() {
     for (int i = 0; i < 4; i++) {
-      output_[i] = std::clamp(power_control_data_.new_output_current_3508[i] /
-                                  M3508_NM_TO_LSB_RATIO * PARAM.reduction_ratio,
-                              -6.0f, 6.0f);
+      output_.torque_output[i] =
+          std::clamp(power_.limited.new_output_current_3508[i] /
+                         M3508_NM_TO_LSB_RATIO * PARAM.reduction_ratio,
+                     -6.0f, 6.0f);
     }
     if (chassis_event_ == ChassisMode::RELAX) {
       LostCtrl();
       return;
     } else {
       for (int i = 0; i < 4; i++) {
-        motor_cmd_[i].torque = std::clamp(output_[i], -6.0f, 6.0f);
+        wheel_.command[i].torque =
+            std::clamp(output_.torque_output[i], -6.0f, 6.0f);
       }
       for (int i = 0; i < 4; i++) {
-        motor_wheel_[i]->Control(motor_cmd_[i]);
+        wheel_.motor[i]->Control(wheel_.command[i]);
       }
     }
   }
@@ -703,327 +769,85 @@ class Omni {
    */
   void LostCtrl() {
     for (int i = 0; i < 4; i++) {
-      motor_wheel_[i]->Relax();
+      wheel_.motor[i]->Relax();
     }
   }
 
  private:
-  /* 底盘 UI 图层, 模式文字、中间外框、电容框和电容条共用 */
-  static constexpr uint8_t UI_LAYER_CHASSIS = 3;
-  /* 底盘 UI 文字共用线宽和字号 */
-  static constexpr uint16_t UI_CHAR_WIDTH = 2;
-  static constexpr uint16_t UI_FONT_SIZE = 20;
-  /* 左下区域底盘模式文字位置 */
-  static constexpr uint16_t UI_MODE_TEXT_X = 160;
-  static constexpr uint16_t UI_MODE_TEXT_Y = 725;
-  /* 左下区域 AI 模式文字位置 */
-  static constexpr uint16_t UI_AI_TEXT_X = 160;
-  static constexpr uint16_t UI_AI_TEXT_Y = 675;
-  /* 左侧电容外框位置和尺寸 */
-  static constexpr uint16_t UI_CAP_BOX_X1 = 160;
-  static constexpr uint16_t UI_CAP_BOX_Y1 = 612;
-  static constexpr uint16_t UI_CAP_BOX_X2 = 320;
-  static constexpr uint16_t UI_CAP_BOX_Y2 = 640;
-  static constexpr uint16_t UI_CAP_BOX_WIDTH = 2;
-  /* 电容能量填充条内边距和线宽 */
-  static constexpr uint16_t UI_CAP_FILL_MARGIN = 4;
-  static constexpr uint16_t UI_CAP_FILL_WIDTH = 8;
-  /* 中间外框位置和尺寸, 当前只绘制外框 */
-  static constexpr uint16_t UI_STATUS_BOX_X1 = 780;
-  static constexpr uint16_t UI_STATUS_BOX_Y1 = 360;
-  static constexpr uint16_t UI_STATUS_BOX_X2 = 1200;
-  static constexpr uint16_t UI_STATUS_BOX_Y2 = 760;
-  static constexpr uint16_t UI_STATUS_BOX_WIDTH = 4;
-  /* 中间外框左右两侧引导斜线的线宽与端点坐标 */
-  static constexpr uint16_t UI_STATUS_GUIDE_WIDTH = 4;
-  static constexpr uint16_t UI_STATUS_GUIDE_LEFT_X1 = 493;
-  static constexpr uint16_t UI_STATUS_GUIDE_LEFT_Y1 = 199;
-  static constexpr uint16_t UI_STATUS_GUIDE_LEFT_X2 = 913;
-  static constexpr uint16_t UI_STATUS_GUIDE_LEFT_Y2 = 471;
-  static constexpr uint16_t UI_STATUS_GUIDE_RIGHT_X1 = 1427;
-  static constexpr uint16_t UI_STATUS_GUIDE_RIGHT_Y1 = 199;
-  static constexpr uint16_t UI_STATUS_GUIDE_RIGHT_X2 = 1007;
-  static constexpr uint16_t UI_STATUS_GUIDE_RIGHT_Y2 = 471;
-  /* 底盘 UI 刷新周期和分时重发节奏 */
-  static constexpr uint32_t UI_REFRESH_PERIOD_MS = 100;
-  static constexpr uint32_t UI_BOX_RESEND_DIV = 10;
-  static constexpr uint32_t UI_GUIDE_RESEND_OFFSET = 1;
-  static constexpr uint32_t UI_MODE_TEXT_TICK = 3;
-  static constexpr uint32_t UI_AI_TEXT_TICK = 0;
-  static constexpr uint32_t UI_TEXT_READD_DIV = 10;
-  static constexpr uint32_t UI_AI_TEXT_REFRESH_DIV = 3;
-  static constexpr uint32_t UI_AI_TEXT_READD_DIV = 37;
-  static constexpr uint32_t UI_CAP_FILL_REFRESH_DIV = 3;
-  static constexpr uint32_t UI_CAP_FILL_REFRESH_OFFSET = 2;
-  /* 电容条低频重建周期, 客户端丢图后靠 ADD 补回来 */
-  static constexpr uint32_t UI_CAP_FILL_READD_DIV = 50;
+  /* === 状态分层（对齐 Gimbal 范式）===
+   * 1. PARAM    构造期配置，const；
+   * 2. wheel_   执行器层：电机句柄 + 每轮反馈/命令/在线状态；
+   * 3. motion_  运动状态：跨周期、watch 主要观测入口；
+   * 4. output_  输出链：单周期内跨函数生产/消费的中间量；
+   * 5. power_   功率遥测：与 PowerControl 的往返数据。
+   * 其余平铺成员与 Gimbal 同构：PID 组 / 时序 / 模式 / 框架句柄。
+   * 调试：watch `chassis.chassis_` 按声明顺序展开以上节点。 */
 
-  static void ResetModeUILocked(Omni* omni) {
-    omni->ui_text_initialized_ = false;
-    omni->ui_frame_initialized_ = false;
-    omni->ui_guide_initialized_ = false;
-    omni->ui_cap_fill_initialized_ = false;
-    omni->ui_ai_text_initialized_ = false;
-    omni->ui_layer_cleared_ = false;
-    omni->ui_refresh_tick_ = 0;
-  }
+  /* 几何/运动学常量（来自 <numbers>，与旧字面量逐位一致）。
+     注意：本工具链 libc++ 无 std::numbers::inv_sqrt2，用精确的 /2 派生。 */
+  static constexpr float SQRT2 = static_cast<float>(std::numbers::sqrt2);
+  static constexpr float INV_SQRT2 = SQRT2 / 2.0f;
 
-  static const char* GetModeText(ChassisMode mode) {
-    switch (mode) {
-      case ChassisMode::RELAX:
-        return "RELX";
-      case ChassisMode::INDEPENDENT:
-        return "INDP";
-      case ChassisMode::ROTOR:
-        return "ROTO";
-      case ChassisMode::FOLLOW:
-        return "FOLW";
-      default:
-        return "UNKN";
-    }
-  }
-
-  static void FormatModeText(char (&text)[16], ChassisMode mode) {
-    std::snprintf(text, sizeof(text), "%s", GetModeText(mode));
-  }
-
-  static const char* GetAIModeText(bool enabled) {
-    return enabled ? "AI ON" : "AI OFF";
-  }
-
-  static Referee::UIColor GetAIModeColor(bool enabled) {
-    return enabled ? Referee::UIColor::UI_COLOR_YELLOW
-                   : Referee::UIColor::UI_COLOR_ORANGE;
-  }
-
-  static void DrawUI(Omni* omni) {
-    if (omni->referee_ == nullptr) {
-      return;
-    }
-    const uint16_t ROBOT_ID = omni->referee_->GetRobotID();
-    if (ROBOT_ID == 0) {
-      return;
-    }
-    const uint16_t CLIENT_ID = omni->referee_->GetClientID(ROBOT_ID);
-
-    omni->mutex_.Lock();
-    const ChassisMode MODE = omni->chassis_event_;
-    const bool UI_TEXT_INITIALIZED = omni->ui_text_initialized_;
-    const bool UI_FRAME_INITIALIZED = omni->ui_frame_initialized_;
-    const bool UI_GUIDE_INITIALIZED = omni->ui_guide_initialized_;
-    const bool UI_CAP_FILL_INITIALIZED = omni->ui_cap_fill_initialized_;
-    const bool UI_AI_TEXT_INITIALIZED = omni->ui_ai_text_initialized_;
-    const bool UI_LAYER_CLEARED = omni->ui_layer_cleared_;
-    const uint32_t UI_TICK = omni->ui_refresh_tick_++;
-    const bool AI_MODE_ENABLED =
-        omni->cmd_ != nullptr &&
-        omni->cmd_->GetCtrlMode() == CMD::Mode::CMD_AUTO_CTRL;
-    const bool CAP_ONLINE =
-        omni->power_control_ != nullptr && omni->power_control_->IsOnline();
-    const float CAP_ENERGY = omni->power_control_ != nullptr
-                                 ? omni->power_control_->GetCapEnergy()
-                                 : 0.0f;
-    omni->mutex_.Unlock();
-    Referee::UILayerDelete ui_del{};
-    ui_del.delete_type =
-        static_cast<uint8_t>(Referee::UIDeleteType::UI_DELETE_LAYER);
-    ui_del.layer = UI_LAYER_CHASSIS;
-    if (!UI_LAYER_CLEARED) {
-      if (omni->referee_->SendUILayerDelete(ROBOT_ID, CLIENT_ID, ui_del) !=
-          LibXR::ErrorCode::OK) {
-        return;
-      }
-      omni->mutex_.Lock();
-      omni->ui_layer_cleared_ = true;
-      omni->mutex_.Unlock();
-      return;
-    }
-
-    if (!UI_FRAME_INITIALIZED || (UI_TICK % UI_BOX_RESEND_DIV) == 0) {
-      Referee::UIFigure2 box_figs{};
-      /*
-       * 这里绘制两个外框
-       * CBX 是中间自瞄外框
-       * CPF 是左侧电容外框
-       */
-      omni->referee_->FillRect(
-          box_figs.interaction_figure[0], "CBX", Referee::UIFigureOp::UI_OP_ADD,
-          UI_LAYER_CHASSIS, Referee::UIColor::UI_COLOR_CYAN,
-          UI_STATUS_BOX_WIDTH, UI_STATUS_BOX_X1, UI_STATUS_BOX_Y1,
-          UI_STATUS_BOX_X2, UI_STATUS_BOX_Y2);
-      omni->referee_->FillRect(
-          box_figs.interaction_figure[1], "CPF", Referee::UIFigureOp::UI_OP_ADD,
-          UI_LAYER_CHASSIS, Referee::UIColor::UI_COLOR_WHITE, UI_CAP_BOX_WIDTH,
-          UI_CAP_BOX_X1, UI_CAP_BOX_Y1, UI_CAP_BOX_X2, UI_CAP_BOX_Y2);
-      if (omni->referee_->SendUIFigure2(ROBOT_ID, CLIENT_ID, box_figs) ==
-          LibXR::ErrorCode::OK) {
-        omni->mutex_.Lock();
-        omni->ui_frame_initialized_ = true;
-        omni->ui_cap_fill_initialized_ = false;
-        omni->mutex_.Unlock();
-      }
-      return;
-    }
-
-    if ((UI_TICK % UI_CAP_FILL_REFRESH_DIV) == UI_CAP_FILL_REFRESH_OFFSET) {
-      Referee::UIFigure cap_fill_fig{};
-      const bool REBUILD_CAP_FILL =
-          !UI_CAP_FILL_INITIALIZED || (UI_TICK % UI_CAP_FILL_READD_DIV) == 2;
-      /* 单独更新电容框内部的能量填充条 */
-      const uint16_t INNER_X1 = UI_CAP_BOX_X1 + UI_CAP_FILL_MARGIN;
-      const uint16_t INNER_Y1 = UI_CAP_BOX_Y1 + UI_CAP_FILL_MARGIN;
-      const uint16_t INNER_Y2 = UI_CAP_BOX_Y2 - UI_CAP_FILL_MARGIN;
-      uint16_t inner_x2 = INNER_X1;
-      if (CAP_ONLINE) {
-        const float CLAMPED_CAP_ENERGY = std::clamp(CAP_ENERGY, 0.0f, 1.0f);
-        const float INNER_WIDTH = static_cast<float>(
-            (UI_CAP_BOX_X2 - UI_CAP_BOX_X1) - (UI_CAP_FILL_MARGIN * 2));
-        inner_x2 = static_cast<uint16_t>(
-            INNER_X1 + std::lround(INNER_WIDTH * CLAMPED_CAP_ENERGY));
-        inner_x2 = std::clamp(
-            inner_x2, INNER_X1,
-            static_cast<uint16_t>(UI_CAP_BOX_X2 - UI_CAP_FILL_MARGIN));
-      }
-      omni->referee_->FillRect(
-          cap_fill_fig, "CPI",
-          REBUILD_CAP_FILL ? Referee::UIFigureOp::UI_OP_ADD
-                           : Referee::UIFigureOp::UI_OP_MODIFY,
-          UI_LAYER_CHASSIS,
-          CAP_ONLINE ? Referee::UIColor::UI_COLOR_WHITE
-                     : Referee::UIColor::UI_COLOR_BLACK,
-          UI_CAP_FILL_WIDTH, INNER_X1, INNER_Y1, inner_x2, INNER_Y2);
-      if (omni->referee_->SendUIFigure(ROBOT_ID, CLIENT_ID, cap_fill_fig) ==
-          LibXR::ErrorCode::OK) {
-        omni->mutex_.Lock();
-        omni->ui_cap_fill_initialized_ = true;
-        omni->mutex_.Unlock();
-      }
-      return;
-    }
-
-    if (!UI_GUIDE_INITIALIZED ||
-        (UI_TICK % UI_BOX_RESEND_DIV) == UI_GUIDE_RESEND_OFFSET) {
-      Referee::UIFigure2 guide_figs{};
-      /* 左右两侧的引导斜线 */
-      omni->referee_->FillLine(guide_figs.interaction_figure[0], "GLF",
-                               Referee::UIFigureOp::UI_OP_ADD, UI_LAYER_CHASSIS,
-                               Referee::UIColor::UI_COLOR_GREEN,
-                               UI_STATUS_GUIDE_WIDTH, UI_STATUS_GUIDE_LEFT_X1,
-                               UI_STATUS_GUIDE_LEFT_Y1, UI_STATUS_GUIDE_LEFT_X2,
-                               UI_STATUS_GUIDE_LEFT_Y2);
-      omni->referee_->FillLine(
-          guide_figs.interaction_figure[1], "GRI",
-          Referee::UIFigureOp::UI_OP_ADD, UI_LAYER_CHASSIS,
-          Referee::UIColor::UI_COLOR_GREEN, UI_STATUS_GUIDE_WIDTH,
-          UI_STATUS_GUIDE_RIGHT_X1, UI_STATUS_GUIDE_RIGHT_Y1,
-          UI_STATUS_GUIDE_RIGHT_X2, UI_STATUS_GUIDE_RIGHT_Y2);
-      if (omni->referee_->SendUIFigure2(ROBOT_ID, CLIENT_ID, guide_figs) ==
-          LibXR::ErrorCode::OK) {
-        omni->mutex_.Lock();
-        omni->ui_guide_initialized_ = true;
-        omni->mutex_.Unlock();
-      }
-      return;
-    }
-
-    const bool REBUILD_AI_TEXT =
-        !UI_AI_TEXT_INITIALIZED ||
-        (UI_AI_TEXT_INITIALIZED && UI_TICK >= UI_AI_TEXT_READD_DIV &&
-         (UI_TICK % UI_AI_TEXT_READD_DIV) == UI_AI_TEXT_TICK);
-    const bool UPDATE_AI_TEXT =
-        REBUILD_AI_TEXT ||
-        (UI_TICK % UI_AI_TEXT_REFRESH_DIV) == UI_AI_TEXT_TICK;
-    if (UPDATE_AI_TEXT) {
-      Referee::UICharacter ai_fig{};
-      /* AI 模式开关状态文字 */
-      omni->referee_->FillCharacter(
-          ai_fig, "AIM",
-          REBUILD_AI_TEXT ? Referee::UIFigureOp::UI_OP_ADD
-                          : Referee::UIFigureOp::UI_OP_MODIFY,
-          UI_LAYER_CHASSIS, GetAIModeColor(AI_MODE_ENABLED), UI_FONT_SIZE,
-          UI_CHAR_WIDTH, UI_AI_TEXT_X, UI_AI_TEXT_Y,
-          GetAIModeText(AI_MODE_ENABLED));
-      if (omni->referee_->SendUICharacter(ROBOT_ID, CLIENT_ID, ai_fig) ==
-          LibXR::ErrorCode::OK) {
-        omni->mutex_.Lock();
-        omni->ui_ai_text_initialized_ = true;
-        omni->mutex_.Unlock();
-      }
-      return;
-    }
-
-    Referee::UICharacter mode_fig{};
-    char mode_text[16]{};
-    FormatModeText(mode_text, MODE);
-    const bool REBUILD_MODE_TEXT =
-        !UI_TEXT_INITIALIZED || (UI_TICK % UI_TEXT_READD_DIV) == 4;
-    /* 底盘模式文字本体 */
-    omni->referee_->FillCharacter(
-        mode_fig, "CMT",
-        REBUILD_MODE_TEXT ? Referee::UIFigureOp::UI_OP_ADD
-                          : Referee::UIFigureOp::UI_OP_MODIFY,
-        UI_LAYER_CHASSIS, Referee::UIColor::UI_COLOR_PINK, UI_FONT_SIZE,
-        UI_CHAR_WIDTH, UI_MODE_TEXT_X, UI_MODE_TEXT_Y, mode_text);
-    if (omni->referee_->SendUICharacter(ROBOT_ID, CLIENT_ID, mode_fig) ==
-        LibXR::ErrorCode::OK) {
-      omni->mutex_.Lock();
-      omni->ui_text_initialized_ = true;
-      omni->mutex_.Unlock();
-    }
-  }
-
- private:
   const ChassisParam PARAM;
 
-  float target_motor_omega_[4]{0.0f, 0.0f, 0.0f, 0.0f};
-  float target_motor_force_[4]{0.0f, 0.0f, 0.0f, 0.0f};
-  float target_motor_current_[4]{0.0f, 0.0f, 0.0f, 0.0f};
+  /* 执行器层。电机布局：
+   *  wheel0   ▲ y  wheel3
+   *      ↙    │     ↖
+   *           │
+   *  ─────────┼────────▶x
+   *           │
+   *      ↘    │     ↗
+   *  wheel1   │    wheel2 */
+  struct Wheels {
+    Motor* motor[4]{};
+    Motor::Feedback feedback[4]{};
+    Motor::MotorCmd command[4]{}; /* 恒 MODE_TORQUE，构造期置参 */
+    bool online[4]{};
+  };
+  Wheels wheel_;
 
-  float output_[4]{0.0f, 0.0f, 0.0f, 0.0f};
+  /* 车体系运动状态（m/s、rad/s）。setpoint 由 UpdateCMD() 解析，
+   * measured 由 SelfResolution() 正解；euler 来自本板 chassis_euler
+   * 主题，是底盘倾角前馈的直接来源。yawmotor_angle 仅用于
+   * FOLLOW/ROTOR 的指令旋转变换，勿动其 wrap/zero 语义。 */
+  struct MotionState {
+    CMD::NavigationVelocity setpoint{};
+    CMD::NavigationVelocity measured{};
+    LibXR::EulerAngle<float> euler{};
+    float yawmotor_angle = 0.0f;
+    float gyro_wz = 0.0f; /* 本板 IMU 陀螺 z（rad/s），变速小陀螺 ω 源 */
+    float rotor_dynamic_scale = 1.0f; /* 功率相关动态缩放 */
+  };
+  MotionState motion_;
 
-  float now_vx_ = 0.0f;
-  float now_vy_ = 0.0f;
-  float now_omega_ = 0.0f;
+  /* 输出链：每周期依序经 InverseKinematicsSolution() →
+   * DynamicInverseSolution() → CalculateMotorCurrent() →
+   * PowerControlUpdate() → OutputToDynamics() 各级生产/消费，
+   * 跨函数因此保留为成员；同函数生灭的中间量一律局部化。 */
+  struct OutputStage {
+    float omega_setpoint[4]{};
+    float force_setpoint[4]{};
+    float torque_output[4]{};
+    float feedforward_torque[4]{}; /* FeedForward() 写 → CalculateMotorCurrent
+                                      读 */
+  };
+  OutputStage output_;
 
-  float target_vx_ = 0.0f;
-  float target_vy_ = 0.0f;
-  float target_omega_ = 0.0f;
-  float rotor_dynamic_scale_ = 1.0f; /* 功率相关动态缩放 */
+  /* 功率遥测：motor_data_ 为送入 PowerControl 的电机数据往返，
+   * limited 为限幅后的输出快照。 */
+  struct PowerStage {
+    MotorData motor_data_{};
+    PowerControlData limited{};
+  };
+  PowerStage power_;
 
-  float imu_yaw_ = 0.0f;
-  float imu_roll_ = 0.0f;
-  float imu_pitch_ = 0.0f;
-  float yawmotor_angle_ = 0.0f;
-  float pitchmotor_angle_ = 0.0f;
-
-  float length_[4]{0.0f, 0.0f, 0.0f, 0.0f};
-  float torque_n_[4]{0.0f, 0.0f, 0.0f, 0.0f};
-  float baseff_l_[4]{0.0f, 0.0f, 0.0f, 0.0f};
-  float px = 0.0f;
-  float py = 0.0f;
-  float post_x_[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-  float post_y_[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-
-  float chassis_roll_ = 0.0f;
-  float chassis_pitch_ = 0.0f;
-  float torque_ff_[4]{0.0, 0.0, 0.0, 0.0};
-  float baseff_[4]{0.0, 0.0, 0.0, 0.0};
-  float gx_ff_;
-  float gy_ff_;
-  float dt_ = 0;
-  LibXR::MicrosecondTimestamp last_online_time_ = 0;
-
-  Motor* motor_wheel_0_;
-  Motor* motor_wheel_1_;
-  Motor* motor_wheel_2_;
-  Motor* motor_wheel_3_;
-
-  Motor* motor_wheel_[4]{motor_wheel_0_, motor_wheel_1_, motor_wheel_2_,
-                         motor_wheel_3_};
-  bool motor_online_3508_[4]{};
-  Motor::Feedback motor_feedback_[4]{};
-  Motor::MotorCmd motor_cmd_[4]{};
-  MotorData motor_data_{};
+  /* 变速小陀螺（ROTOR_VARIABLE）扭矩波形机状态 */
+  struct SpinState {
+    bool driving = false; /* true=DRIVE 恒扭矩，false=COAST 滑行 */
+    LibXR::MicrosecondTimestamp phase_start_us = 0;
+    float tau_cmd = 0.0f; /* 底盘级偏航扭矩指令 N·m（含符号） */
+  };
+  SpinState spin_;
 
   LibXR::PID<float> pid_follow_;
   LibXR::PID<float> pid_velocity_x_;
@@ -1035,39 +859,19 @@ class Omni {
       LibXR::PID<float>(LibXR::PID<float>::Param()),
       LibXR::PID<float>(LibXR::PID<float>::Param()),
       LibXR::PID<float>(LibXR::PID<float>::Param())};
-  LibXR::PID<float> pid_steer_angle_[4] = {
-      LibXR::PID<float>(LibXR::PID<float>::Param()),
-      LibXR::PID<float>(LibXR::PID<float>::Param()),
-      LibXR::PID<float>(LibXR::PID<float>::Param()),
-      LibXR::PID<float>(LibXR::PID<float>::Param())};
 
-  LibXR::PID<float> pid_steer_speed_[4] = {
-      LibXR::PID<float>(LibXR::PID<float>::Param()),
-      LibXR::PID<float>(LibXR::PID<float>::Param()),
-      LibXR::PID<float>(LibXR::PID<float>::Param()),
-      LibXR::PID<float>(LibXR::PID<float>::Param())};
+  float dt_ = 0;
+  LibXR::MicrosecondTimestamp last_online_time_ = 0;
+  LibXR::MicrosecondTimestamp last_gyro_time_ = 0; /* 陀螺新鲜度判据 */
 
-  LibXR::Thread thread_;
-  LibXR::Mutex mutex_;
+  ChassisMode chassis_event_ = ChassisMode::RELAX;
 
   CMD* cmd_;
   CMD::ChassisCMD cmd_data_{};
 
   PowerControl* power_control_;
-  PowerControlData power_control_data_;
-
-  Referee* referee_;
   Referee::ChassisPack referee_chassis_pack_{};
 
-  LibXR::EulerAngle<float> euler_;
-  ChassisMode chassis_event_ = ChassisMode::RELAX;
-
-  bool ui_text_initialized_ = false;
-  bool ui_frame_initialized_ = false;
-  bool ui_guide_initialized_ = false;
-  bool ui_cap_fill_initialized_ = false;
-  bool ui_ai_text_initialized_ = false;
-  bool ui_layer_cleared_ = false;
-  uint32_t ui_refresh_tick_ = 0;
-  LibXR::Timer::TimerHandle timer_ui_{};
+  LibXR::Thread thread_;
+  LibXR::Mutex mutex_;
 };

@@ -31,6 +31,11 @@ constructor_args:
       rotor_buffer_low_j: 35.0
       rotor_buffer_high_j: 70.0
       rotor_scale_lpf_alpha: 0.2
+      spin_torque_amp_nm: 15.0
+      spin_omega_hi_rad_s: 14.0
+      spin_omega_lo_rad_s: 6.0
+      spin_omega_max_rad_s: 16.0
+      spin_drive_timeout_s: 2.0
   - pid_follow_:
       k: 1.0
       p: 20.0
@@ -223,6 +228,12 @@ class Chassis : public LibXR::Application {
     float rotor_buffer_low_j = 35.0f;
     float rotor_buffer_high_j = 70.0f;
     float rotor_scale_lpf_alpha = 0.2f;
+    /* 变速小陀螺（ROTOR_VARIABLE）：扭矩域滞环参数 */
+    float spin_torque_amp_nm = 15.0f;
+    float spin_omega_hi_rad_s = 14.0f;
+    float spin_omega_lo_rad_s = 6.0f;
+    float spin_omega_max_rad_s = 16.0f;
+    float spin_drive_timeout_s = 2.0f;
   };
 
   Chassis(
@@ -263,7 +274,12 @@ class Chassis : public LibXR::Application {
                 chassis_param.rotor_omega_min_scale,
                 chassis_param.rotor_buffer_low_j,
                 chassis_param.rotor_buffer_high_j,
-                chassis_param.rotor_scale_lpf_alpha},
+                chassis_param.rotor_scale_lpf_alpha,
+                chassis_param.spin_torque_amp_nm,
+                chassis_param.spin_omega_hi_rad_s,
+                chassis_param.spin_omega_lo_rad_s,
+                chassis_param.spin_omega_max_rad_s,
+                chassis_param.spin_drive_timeout_s},
             pid_follow_, pid_velocity_x_, pid_velocity_y_, pid_omega_,
             pid_wheel_speed_0_, pid_wheel_speed_1_, pid_wheel_speed_2_,
             pid_wheel_speed_3_, pid_steer_angle_0_, pid_steer_angle_1_,
@@ -287,6 +303,12 @@ class Chassis : public LibXR::Application {
                             callback);
     chassis_event_.Register(static_cast<uint32_t>(ChassisMode::FOLLOW),
                             callback);
+    if constexpr (std::is_same<ChassisType, Omni>::value) {
+      chassis_event_.Register(static_cast<uint32_t>(ChassisMode::NAVIGATION),
+                              callback);
+      chassis_event_.Register(
+          static_cast<uint32_t>(ChassisMode::ROTOR_VARIABLE), callback);
+    }
     /*
      * TRACK_START 只属于麦轮
      * 编译期判断可以让 Omni 和 Helm 继续使用各自的枚举
@@ -304,6 +326,9 @@ class Chassis : public LibXR::Application {
    */
   LibXR::Event& GetEvent() { return chassis_event_; }
 
+  /** @brief 获取底盘实现的实际模式。 */
+  ChassisMode GetMode() { return chassis_.GetMode(); }
+
   /**
    * @brief 事件处理器，根据传入的事件ID执行相应操作
    * @param event_id 触发的事件ID
@@ -313,6 +338,26 @@ class Chassis : public LibXR::Application {
   void OnMonitor() override {}
 
  private:
+  /**
+   * @brief 具体底盘实现（`Omni` / `Mecanum` /
+   * `Helm`），持有**全部**运行期状态。
+   *
+   * @note `Chassis<ChassisType>` 本身只是**适配层**，只干三件事：
+   *       ① 提供 `LibXR::Application` 接口（`OnMonitor`，供 `appmgr` 托管）；
+   *       ② 提供 Event 事件总线（`chassis_event_` + `GetEvent()`，供
+   * `EventBinder` 绑定遥控通道、以及 `DualBoard` 里
+   * `chassis_->GetEvent().Active(mode)` 从底盘板远程切模式）； ③ 把 manifest
+   * 那份**与底盘类型无关**的 `ChassisParam` 转译成
+   *          `ChassisType::ChassisParam`（各具体底盘的 manifest 是空的
+   *          `constructor_args: []`，不能直接被 xrobot 实例化）。
+   *
+   *       所以 `PARAM`、`wheel_*`、`pid_*`、`dt_` 这些都在 `chassis_` 里面。
+   *       ⚠️ 调试时请直接 watch
+   * `chassis.chassis_`（或在已展开的节点上复制表达式），
+   *       否则要先多展开一层。改成继承**并不能**省掉这一层——基类子对象在调试器里
+   *       同样是一个独立节点，只是名字会变成 `<inherited
+   * members>`，反而更难找。
+   */
   ChassisType chassis_;
   LibXR::Event chassis_event_;
 };
