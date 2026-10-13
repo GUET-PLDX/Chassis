@@ -3,184 +3,15 @@
 // clang-format off
 /* === MODULE MANIFEST V2 ===
 module_description: No description provided
-constructor_args:
-  - motor_wheel_0: '@&motor_wheel_0'
-  - motor_wheel_1: '@&motor_wheel_1'
-  - motor_wheel_2: '@&motor_wheel_2'
-  - motor_wheel_3: '@&motor_wheel_3'
-  - motor_steer_0: '@&motor_steer_0'
-  - motor_steer_1: '@&motor_steer_1'
-  - motor_steer_2: '@&motor_steer_2'
-  - motor_steer_3: '@&motor_steer_3'
-  - cmd: '@&cmd'
-  - power_control: '@&power_control'
-  - referee: '@&ref'
-  - task_stack_depth: 1536
-  - ChassisParam:
-      wheel_radius: 0.065
-      wheel_to_center: 0.26
-      gravity_height: 0.0
-      reduction_ratio: 15.7647
-      wheel_resistance: 0.0
-      error_compensation: 0.0
-      gravity: 230
-      length: 0.0
-      width: 0.0
-      rotor_speed_scale: 0.95
-      rotor_omega_min_scale: 0.55
-      rotor_buffer_low_j: 35.0
-      rotor_buffer_high_j: 70.0
-      rotor_scale_lpf_alpha: 0.2
-      spin_torque_amp_nm: 15.0
-      spin_omega_hi_rad_s: 14.0
-      spin_omega_lo_rad_s: 6.0
-      spin_omega_max_rad_s: 16.0
-      spin_drive_timeout_s: 2.0
-  - pid_follow_:
-      k: 1.0
-      p: 20.0
-      i: 0.0
-      d: 0.0
-      i_limit: 0.0
-      out_limit: 30.0
-      cycle: true
-  - pid_velocity_x_:
-      k: 1.0
-      p: 20.0
-      i: 0.0
-      d: 0.0
-      i_limit: 0.0
-      out_limit: 30.0
-      cycle: false
-  - pid_velocity_y_:
-      k: 1.0
-      p: 20.0
-      i: 0.0
-      d: 0.0
-      i_limit: 0.0
-      out_limit: 30.0
-      cycle: false
-  - pid_omega_:
-      k: 1.0
-      p: 20.0
-      i: 0.0
-      d: 0.0
-      i_limit: 0.0
-      out_limit: 30.0
-      cycle: false
-  - pid_wheel_speed_0_:
-      k: 1.0
-      p: 0.3
-      i: 0.0
-      d: 0.0
-      i_limit: 0.0
-      out_limit: 5.0
-      cycle: false
-  - pid_wheel_speed_1_:
-      k: 1.0
-      p: 0.3
-      i: 0.0
-      d: 0.0
-      i_limit: 0.0
-      out_limit: 5.0
-      cycle: false
-  - pid_wheel_speed_2_:
-      k: 1.0
-      p: 0.3
-      i: 0.0
-      d: 0.0
-      i_limit: 0.0
-      out_limit: 5.0
-      cycle: false
-  - pid_wheel_speed_3_:
-      k: 1.0
-      p: 0.3
-      i: 0.0
-      d: 0.0
-      i_limit: 0.0
-      out_limit: 5.0
-      cycle: false
-  - pid_steer_angle_0_:
-      k: 1.0
-      p: 0.0
-      i: 0.0
-      d: 0.0
-      i_limit: 0.0
-      out_limit: 0.0
-      cycle: false
-  - pid_steer_angle_1_:
-      k: 1.0
-      p: 0.0
-      i: 0.0
-      d: 0.0
-      i_limit: 0.0
-      out_limit: 0.0
-      cycle: false
-  - pid_steer_angle_2_:
-      k: 1.0
-      p: 0.0
-      i: 0.0
-      d: 0.0
-      i_limit: 0.0
-      out_limit: 0.0
-      cycle: false
-  - pid_steer_angle_3_:
-      k: 1.0
-      p: 0.0
-      i: 0.0
-      d: 0.0
-      i_limit: 0.0
-      out_limit: 0.0
-      cycle: false
-  - pid_steer_speed_0_:
-      k: 1.0
-      p: 0.0
-      i: 0.0
-      d: 0.0
-      i_limit: 0.0
-      out_limit: 0.0
-      cycle: false
-  - pid_steer_speed_1_:
-      k: 1.0
-      p: 0.0
-      i: 0.0
-      d: 0.0
-      i_limit: 0.0
-      out_limit: 0.0
-      cycle: false
-  - pid_steer_speed_2_:
-      k: 1.0
-      p: 0.0
-      i: 0.0
-      d: 0.0
-      i_limit: 0.0
-      out_limit: 0.0
-      cycle: false
-  - pid_steer_speed_3_:
-      k: 1.0
-      p: 0.0
-      i: 0.0
-      d: 0.0
-      i_limit: 0.0
-      out_limit: 0.0
-      cycle: false
-  - thread_priority: LibXR::Thread::Priority::HIGH
-template_args:
-  - ChassisType: Omni
-required_hardware:
-  - dr16
-  - motor
-  - can
-  - bmi088
 depends:
-  - pldx/BMI088
-  - pldx/Motor
-  - pldx/RMMotor
-  - pldx/CMD
-  - pldx/MadgwickAHRS
-  - pldx/PowerControl
-  - pldx/Referee
-  - pldx/SuperPower
+- id: GUET-PLDX/BMI088
+- id: GUET-PLDX/Motor
+- id: GUET-PLDX/RMMotor
+- id: GUET-PLDX/CMD
+- id: GUET-PLDX/MadgwickAHRS
+- id: GUET-PLDX/PowerControl
+- id: GUET-PLDX/Referee
+- id: GUET-PLDX/SuperPower
 === END MANIFEST === */
 // clang-format on
 
@@ -205,12 +36,12 @@ struct MotorData {
 #include "Omni.hpp"
 #include "RMMotor.hpp"
 #include "Referee.hpp"
-#include "app_framework.hpp"
+#include "libxr.hpp"
 #include "libxr_def.hpp"
 #include "pid.hpp"
 
 template <typename ChassisType>
-class Chassis : public LibXR::Application {
+class Chassis {
  public:
   using ChassisMode = typename ChassisType::ChassisMode;
   struct ChassisParam {
@@ -237,7 +68,6 @@ class Chassis : public LibXR::Application {
   };
 
   Chassis(
-      LibXR::HardwareContainer& hw, LibXR::ApplicationManager& app,
       Motor* motor_wheel_0, Motor* motor_wheel_1, Motor* motor_wheel_2,
       Motor* motor_wheel_3, Motor* motor_steer_0, Motor* motor_steer_1,
       Motor* motor_steer_2, Motor* motor_steer_3, CMD* cmd,
@@ -261,7 +91,7 @@ class Chassis : public LibXR::Application {
       LibXR::PID<float>::Param pid_steer_speed_3_ = {},
       LibXR::Thread::Priority thread_priority = LibXR::Thread::Priority::HIGH)
       : chassis_(
-            hw, app, motor_wheel_0, motor_wheel_1, motor_wheel_2, motor_wheel_3,
+            motor_wheel_0, motor_wheel_1, motor_wheel_2, motor_wheel_3,
             motor_steer_0, motor_steer_1, motor_steer_2, motor_steer_3, cmd,
             power_control, referee, task_stack_depth,
             typename ChassisType::ChassisParam{
@@ -335,7 +165,7 @@ class Chassis : public LibXR::Application {
    */
   void EventHandler(uint32_t event_id) { chassis_.SetMode(event_id); }
 
-  void OnMonitor() override {}
+  void OnMonitor() {}
 
  private:
   /**
@@ -343,13 +173,13 @@ class Chassis : public LibXR::Application {
    * `Helm`），持有**全部**运行期状态。
    *
    * @note `Chassis<ChassisType>` 本身只是**适配层**，只干三件事：
-   *       ① 提供 `LibXR::Application` 接口（`OnMonitor`，供 `appmgr` 托管）；
+   *       ① 提供 `OnMonitor`，供静态装配监控循环调用；
    *       ② 提供 Event 事件总线（`chassis_event_` + `GetEvent()`，供
    * `EventBinder` 绑定遥控通道、以及 `DualBoard` 里
    * `chassis_->GetEvent().Active(mode)` 从底盘板远程切模式）； ③ 把 manifest
    * 那份**与底盘类型无关**的 `ChassisParam` 转译成
    *          `ChassisType::ChassisParam`（各具体底盘的 manifest 是空的
-   *          `constructor_args: []`，不能直接被 xrobot 实例化）。
+   *          `standalone: false`，不能直接被 xrobot 实例化）。
    *
    *       所以 `PARAM`、`wheel_*`、`pid_*`、`dt_` 这些都在 `chassis_` 里面。
    *       ⚠️ 调试时请直接 watch

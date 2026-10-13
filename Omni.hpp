@@ -3,9 +3,6 @@
 // clang-format off
 /* === MODULE MANIFEST V2 ===
 module_description: No description provided
-constructor_args: []
-template_args: []
-required_hardware: []
 depends: []
 === END MANIFEST === */
 // clang-format on
@@ -19,7 +16,7 @@ depends: []
 #include "Motor.hpp"
 #include "PowerControl.hpp"
 #include "Referee.hpp"
-#include "app_framework.hpp"
+#include "libxr.hpp"
 #include "libxr_def.hpp"
 #include "libxr_time.hpp"
 #include "pid.hpp"
@@ -72,8 +69,6 @@ class Omni {
 
   /**
    * @brief 构造函数，初始化全向轮底盘控制对象
-   * @param hw 硬件容器引用
-   * @param app 应用管理器引用
    * @param cmd 控制命令引用
    * @param motor_wheel_0 第0个驱动轮电机指针
    * @param motor_wheel_1 第1个驱动轮电机指针
@@ -98,8 +93,7 @@ class Omni {
    * @param pid_steer_angle_2 舵机2角度PID参数（本底盘未使用）
    * @param pid_steer_angle_3 舵机3角度PID参数（本底盘未使用）
    */
-  Omni(LibXR::HardwareContainer& hw, LibXR::ApplicationManager& app,
-       Motor* motor_wheel_0, Motor* motor_wheel_1, Motor* motor_wheel_2,
+  Omni(Motor* motor_wheel_0, Motor* motor_wheel_1, Motor* motor_wheel_2,
        Motor* motor_wheel_3, Motor* motor_steer_0, Motor* motor_steer_1,
        Motor* motor_steer_2, Motor* motor_steer_3, CMD* cmd,
        PowerControl* power_control, Referee* referee, uint32_t task_stack_depth,
@@ -139,8 +133,6 @@ class Omni {
                          pid_wheel_speed_2, pid_wheel_speed_3},
         cmd_(cmd),
         power_control_(power_control) {
-    UNUSED(hw);
-    UNUSED(app);
     UNUSED(motor_steer_0);
     UNUSED(motor_steer_1);
     UNUSED(motor_steer_2);

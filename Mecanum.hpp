@@ -3,9 +3,6 @@
 // clang-format off
 /* === MODULE MANIFEST V2 ===
 module_description: No description provided
-constructor_args: []
-template_args: []
-required_hardware: []
 depends: []
 === END MANIFEST === */
 // clang-format on
@@ -22,8 +19,8 @@ depends: []
 #include "RMMotor.hpp"
 #include "Referee.hpp"
 #include "SuperPower.hpp"
-#include "app_framework.hpp"
 #include "event.hpp"
+#include "libxr.hpp"
 #include "libxr_def.hpp"
 #include "libxr_rw.hpp"
 #include "libxr_time.hpp"
@@ -70,8 +67,6 @@ class Mecanum {
   };
   /**
    * @brief 构造函数，初始化麦轮底盘控制对象
-   * @param hw 硬件容器引用
-   * @param app 应用管理器引用
    * @param cmd 控制命令引用
    * @param motor_wheel_0 第0个驱动轮电机指针
    * @param motor_wheel_1 第1个驱动轮电机指针
@@ -97,7 +92,6 @@ class Mecanum {
    * @param pid_steer_angle_3 舵机3角度PID参数（本底盘未使用）
    */
   Mecanum(
-      LibXR::HardwareContainer& hw, LibXR::ApplicationManager& app,
       Motor* motor_wheel_0, Motor* motor_wheel_1, Motor* motor_wheel_2,
       Motor* motor_wheel_3, Motor* motor_steer_0, Motor* motor_steer_1,
       Motor* motor_steer_2, Motor* motor_steer_3, CMD* cmd,
@@ -147,8 +141,6 @@ class Mecanum {
         cmd_(cmd),
         power_control_(power_control),
         referee_(referee) {
-    UNUSED(hw);
-    UNUSED(app);
     UNUSED(motor_steer_1);
     UNUSED(motor_steer_2);
     UNUSED(motor_steer_3);
