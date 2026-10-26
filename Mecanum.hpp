@@ -1,10 +1,7 @@
 #pragma once
 
 // clang-format off
-/* === MODULE MANIFEST V2 ===
-module_description: No description provided
-depends: []
-=== END MANIFEST === */
+/* MODULE MANIFEST */
 // clang-format on
 #include <algorithm>
 #include <cmath>
