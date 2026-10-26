@@ -60,6 +60,9 @@ class Omni {
     float spin_omega_lo_rad_s = 6.0f;   /* 滞环下限，恢复驱动 rad/s */
     float spin_omega_max_rad_s = 16.0f; /* 硬安全上限，超限强制滑行 rad/s */
     float spin_drive_timeout_s = 2.0f;  /* 单次 DRIVE 相最长时间 s */
+    /* 导航力前馈限幅；0 关闭对应分量。合力 |F| 与偏航力矩分别限幅。 */
+    float ff_max_force_n = 0.0f;
+    float ff_max_torque_nm = 0.0f;
   };
   enum class ChassisMode : uint8_t {
     RELAX,
@@ -208,12 +211,15 @@ class Omni {
     LibXR::Topic::ASyncSubscriber<Eigen::Matrix<float, 3, 1>> gyro_suber(
         "chassis_gyro");
     LibXR::Topic::ASyncSubscriber<float> yawmotor_angle_suber("yawmotor_angle");
+    LibXR::Topic::ASyncSubscriber<CMD::NavigationFeedforward> ff_suber(
+        "chassis_ff");
 
     cmd_suber.StartWaiting();
     referee_suber.StartWaiting();
     chassis_euler_suber.StartWaiting();
     yawmotor_angle_suber.StartWaiting();
     gyro_suber.StartWaiting();
+    ff_suber.StartWaiting();
     omni->last_online_time_ = LibXR::Timebase::GetMicroseconds();
     auto last_time = LibXR::Timebase::GetMilliseconds();
     omni->mutex_.Unlock();
@@ -242,6 +248,11 @@ class Omni {
         omni->motion_.gyro_wz = gyro_suber.GetData().z();
         omni->last_gyro_time_ = LibXR::Timebase::GetMicroseconds();
         gyro_suber.StartWaiting();
+      }
+      if (ff_suber.Available()) {
+        omni->feedforward_ = ff_suber.GetData();
+        omni->last_ff_time_ = LibXR::Timebase::GetMicroseconds();
+        ff_suber.StartWaiting();
       }
       omni->mutex_.Lock();
       omni->Update();
@@ -280,6 +291,27 @@ class Omni {
   ChassisMode GetMode() {
     LibXR::Mutex::LockGuard lock(mutex_);
     return chassis_event_;
+  }
+
+  /** @brief 轮速正解算的车体系实测速度快照（与 setpoint
+   * 同轴同号），供双板回传。 */
+  struct MeasuredState {
+    CMD::NavigationVelocity velocity{};
+    bool wheel_online[4]{};
+    ChassisMode mode = ChassisMode::RELAX;
+    LibXR::MicrosecondTimestamp sample_time_us = 0; /* 0 表示尚未解算 */
+  };
+
+  MeasuredState GetMeasuredState() {
+    LibXR::Mutex::LockGuard lock(mutex_);
+    MeasuredState state{};
+    state.velocity = motion_.measured;
+    for (int i = 0; i < 4; i++) {
+      state.wheel_online[i] = wheel_.online[i];
+    }
+    state.mode = chassis_event_;
+    state.sample_time_us = measured_time_us_;
+    return state;
   }
 
   /**
@@ -529,6 +561,7 @@ class Omni {
          wheel_.feedback[2].omega / PARAM.reduction_ratio +
          wheel_.feedback[3].omega / PARAM.reduction_ratio) *
         PARAM.wheel_radius / (4.0f * PARAM.wheel_to_center);
+    measured_time_us_ = last_online_time_;
   }
 
   /**
@@ -725,15 +758,55 @@ class Omni {
                                      motion_.measured.wz_rad_s, dt_);
     }
 
+    /* 导航力前馈叠加在速度 PID 的力上，再统一做轮间分配与功率控制 */
+    const CMD::NavigationFeedforward FF = ActiveFeedforward();
+    const float FX = FORCE_X + FF.fx_n;
+    const float FY = FORCE_Y + FF.fy_n;
+    force_z += FF.mz_nm / PARAM.wheel_to_center;
+
     /* 按全向轮受力方向分配前馈力 */
-    output_.force_setpoint[0] =
-        (-SQRT2 * FORCE_X - SQRT2 * FORCE_Y + force_z) / 4;
-    output_.force_setpoint[1] =
-        (SQRT2 * FORCE_X - SQRT2 * FORCE_Y + force_z) / 4;
-    output_.force_setpoint[2] =
-        (SQRT2 * FORCE_X + SQRT2 * FORCE_Y + force_z) / 4;
-    output_.force_setpoint[3] =
-        (-SQRT2 * FORCE_X + SQRT2 * FORCE_Y + force_z) / 4;
+    output_.force_setpoint[0] = (-SQRT2 * FX - SQRT2 * FY + force_z) / 4;
+    output_.force_setpoint[1] = (SQRT2 * FX - SQRT2 * FY + force_z) / 4;
+    output_.force_setpoint[2] = (SQRT2 * FX + SQRT2 * FY + force_z) / 4;
+    output_.force_setpoint[3] = (-SQRT2 * FX + SQRT2 * FY + force_z) / 4;
+  }
+
+  /**
+   * @brief 当前生效的导航力前馈（已限幅）
+   * @details 仅导航来源、平移受控模式且 30 ms 内收到有效值时生效，否则为零。
+   *          RELAX/INDEPENDENT 与遥控来源不叠加；ROTOR_VARIABLE 的偏航为扭矩
+   *          波形机，不叠加偏航力矩。
+   */
+  CMD::NavigationFeedforward ActiveFeedforward() const {
+    CMD::NavigationFeedforward ff{};
+    const auto NOW = LibXR::Timebase::GetMicroseconds();
+    const bool FRESH = feedforward_.valid && last_ff_time_ != 0U &&
+                       NOW - last_ff_time_ <= FF_TIMEOUT_US;
+    const bool NAV_MODE = chassis_event_ == ChassisMode::NAVIGATION ||
+                          chassis_event_ == ChassisMode::ROTOR ||
+                          chassis_event_ == ChassisMode::ROTOR_VARIABLE ||
+                          chassis_event_ == ChassisMode::FOLLOW;
+    if (!FRESH || !NAV_MODE ||
+        cmd_data_.source != CMD::ChassisCommandSource::NAVIGATION) {
+      return ff;
+    }
+    float fx = std::isfinite(feedforward_.fx_n) ? feedforward_.fx_n : 0.0f;
+    float fy = std::isfinite(feedforward_.fy_n) ? feedforward_.fy_n : 0.0f;
+    const float NORM = sqrtf(fx * fx + fy * fy);
+    if (NORM > PARAM.ff_max_force_n) {
+      const float SCALE = NORM > 0.0f ? PARAM.ff_max_force_n / NORM : 0.0f;
+      fx *= SCALE;
+      fy *= SCALE;
+    }
+    ff.fx_n = fx;
+    ff.fy_n = fy;
+    if (chassis_event_ != ChassisMode::ROTOR_VARIABLE &&
+        std::isfinite(feedforward_.mz_nm)) {
+      ff.mz_nm = std::clamp(feedforward_.mz_nm, -PARAM.ff_max_torque_nm,
+                            PARAM.ff_max_torque_nm);
+    }
+    ff.valid = true;
+    return ff;
   }
 
   /**
@@ -860,6 +933,12 @@ class Omni {
   float dt_ = 0;
   LibXR::MicrosecondTimestamp last_online_time_ = 0;
   LibXR::MicrosecondTimestamp last_gyro_time_ = 0; /* 陀螺新鲜度判据 */
+  LibXR::MicrosecondTimestamp measured_time_us_ =
+      0; /* 最近一次正解算的采样时刻 */
+  static constexpr uint64_t FF_TIMEOUT_US =
+      30000;                                 /* 力前馈新鲜度：3 个 CAN 周期 */
+  CMD::NavigationFeedforward feedforward_{}; /* 最近一次收到的导航力前馈 */
+  LibXR::MicrosecondTimestamp last_ff_time_ = 0;
 
   ChassisMode chassis_event_ = ChassisMode::RELAX;
 

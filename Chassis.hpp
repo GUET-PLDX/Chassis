@@ -65,6 +65,9 @@ class Chassis {
     float spin_omega_lo_rad_s = 6.0f;
     float spin_omega_max_rad_s = 16.0f;
     float spin_drive_timeout_s = 2.0f;
+    /* 导航力前馈限幅（仅 Omni 使用），0 关闭 */
+    float ff_max_force_n = 0.0f;
+    float ff_max_torque_nm = 0.0f;
   };
 
   Chassis(
@@ -205,32 +208,15 @@ class Chassis {
                                                      .out_limit = 0.0,
                                                      .cycle = false},
       LibXR::Thread::Priority thread_priority = LibXR::Thread::Priority::HIGH)
-      : chassis_(
-            motor_wheel_0, motor_wheel_1, motor_wheel_2, motor_wheel_3,
-            motor_steer_0, motor_steer_1, motor_steer_2, motor_steer_3, cmd,
-            power_control, referee, task_stack_depth,
-            typename ChassisType::ChassisParam{
-                chassis_param.wheel_radius, chassis_param.wheel_to_center,
-                chassis_param.gravity_height, chassis_param.reduction_ratio,
-                chassis_param.wheel_resistance,
-                chassis_param.error_compensation, chassis_param.gravity,
-                chassis_param.length, chassis_param.width,
-                chassis_param.rotor_speed_scale,
-                chassis_param.rotor_omega_min_scale,
-                chassis_param.rotor_buffer_low_j,
-                chassis_param.rotor_buffer_high_j,
-                chassis_param.rotor_scale_lpf_alpha,
-                chassis_param.spin_torque_amp_nm,
-                chassis_param.spin_omega_hi_rad_s,
-                chassis_param.spin_omega_lo_rad_s,
-                chassis_param.spin_omega_max_rad_s,
-                chassis_param.spin_drive_timeout_s},
-            pid_follow_, pid_velocity_x_, pid_velocity_y_, pid_omega_,
-            pid_wheel_speed_0_, pid_wheel_speed_1_, pid_wheel_speed_2_,
-            pid_wheel_speed_3_, pid_steer_angle_0_, pid_steer_angle_1_,
-            pid_steer_angle_2_, pid_steer_angle_3_, pid_steer_speed_0_,
-            pid_steer_speed_1_, pid_steer_speed_2_, pid_steer_speed_3_,
-            thread_priority) {
+      : chassis_(motor_wheel_0, motor_wheel_1, motor_wheel_2, motor_wheel_3,
+                 motor_steer_0, motor_steer_1, motor_steer_2, motor_steer_3,
+                 cmd, power_control, referee, task_stack_depth,
+                 MakeParam(chassis_param), pid_follow_, pid_velocity_x_,
+                 pid_velocity_y_, pid_omega_, pid_wheel_speed_0_,
+                 pid_wheel_speed_1_, pid_wheel_speed_2_, pid_wheel_speed_3_,
+                 pid_steer_angle_0_, pid_steer_angle_1_, pid_steer_angle_2_,
+                 pid_steer_angle_3_, pid_steer_speed_0_, pid_steer_speed_1_,
+                 pid_steer_speed_2_, pid_steer_speed_3_, thread_priority) {
     auto callback = LibXR::Callback<uint32_t>::Create(
         [](bool in_isr, Chassis* chassis, uint32_t event_id) {
           UNUSED(in_isr);
@@ -273,6 +259,39 @@ class Chassis {
 
   /** @brief 获取底盘实现的实际模式。 */
   ChassisMode GetMode() { return chassis_.GetMode(); }
+
+  /** @brief 外壳参数转为具体底盘参数；力前馈限幅只有 Omni 实现。 */
+  static typename ChassisType::ChassisParam MakeParam(
+      const ChassisParam& chassis_param) {
+    typename ChassisType::ChassisParam param{
+        chassis_param.wheel_radius,
+        chassis_param.wheel_to_center,
+        chassis_param.gravity_height,
+        chassis_param.reduction_ratio,
+        chassis_param.wheel_resistance,
+        chassis_param.error_compensation,
+        chassis_param.gravity,
+        chassis_param.length,
+        chassis_param.width,
+        chassis_param.rotor_speed_scale,
+        chassis_param.rotor_omega_min_scale,
+        chassis_param.rotor_buffer_low_j,
+        chassis_param.rotor_buffer_high_j,
+        chassis_param.rotor_scale_lpf_alpha,
+        chassis_param.spin_torque_amp_nm,
+        chassis_param.spin_omega_hi_rad_s,
+        chassis_param.spin_omega_lo_rad_s,
+        chassis_param.spin_omega_max_rad_s,
+        chassis_param.spin_drive_timeout_s};
+    if constexpr (std::is_same<ChassisType, Omni>::value) {
+      param.ff_max_force_n = chassis_param.ff_max_force_n;
+      param.ff_max_torque_nm = chassis_param.ff_max_torque_nm;
+    }
+    return param;
+  }
+
+  /** @brief 轮速正解算的实测速度快照；仅实现了该接口的底盘（Omni）可调用。 */
+  auto GetMeasuredState() { return chassis_.GetMeasuredState(); }
 
   /**
    * @brief 事件处理器，根据传入的事件ID执行相应操作
