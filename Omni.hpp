@@ -43,20 +43,11 @@ class Omni {
     float length = 0.0f;
     float width = 0.0f;
     float rotor_speed_scale =
-        1.0f; /* 小陀螺转速缩放比例，降低可给平移留出更多功率 */
-    float rotor_omega_min_scale = 0.55f; /* 功率受限时小陀螺最小转速比例 */
+        1.0f; /* 旋转模式转速缩放比例，降低可给平移留出更多功率 */
+    float rotor_omega_min_scale = 0.55f; /* 功率受限时旋转最小转速比例 */
     float rotor_buffer_low_j = 35.0f;    /* 缓冲能量低阈值 J */
     float rotor_buffer_high_j = 70.0f;   /* 缓冲能量高阈值 J */
     float rotor_scale_lpf_alpha = 0.2f;  /* 动态缩放一阶低通系数 */
-    /* 变速小陀螺（ROTOR_VARIABLE）：扭矩域滞环参数 */
-    float spin_torque_amp_nm = 15.0f;   /* DRIVE 相底盘偏航扭矩幅值 N·m */
-    float spin_omega_hi_rad_s = 14.0f;  /* 滞环上限，进入滑行 rad/s */
-    float spin_omega_lo_rad_s = 6.0f;   /* 滞环下限，恢复驱动 rad/s */
-    float spin_omega_max_rad_s = 16.0f; /* 硬安全上限，超限强制滑行 rad/s */
-    float spin_drive_timeout_s = 2.0f;  /* 单次 DRIVE 相最长时间 s */
-    /* 导航力前馈限幅；0 关闭对应分量。合力 |F| 与偏航力矩分别限幅。 */
-    float ff_max_force_n = 0.0f;
-    float ff_max_torque_nm = 0.0f;
   };
   enum class ChassisMode : uint8_t {
     RELAX,
@@ -64,7 +55,6 @@ class Omni {
     ROTOR,
     FOLLOW,
     NAVIGATION,
-    ROTOR_VARIABLE, /* 变速小陀螺：扭矩域滞环（追加尾部，线值=5） */
   };
 
   /**
@@ -320,8 +310,6 @@ class Omni {
     for (int i = 0; i < 4; i++) {
       pid_wheel_speed_[i].Reset();
     }
-    spin_.driving = false;
-    spin_.tau_cmd = 0.0f;
     mutex_.Unlock();
   }
 
@@ -334,7 +322,6 @@ class Omni {
         PARAM.wheel_radius * static_cast<float>(OMNI_MOTOR_MAX_OMEGA);
 
     if (cmd_data_.source == CMD::ChassisCommandSource::NAVIGATION) {
-      /* 导航来源的速度已是物理量且已在主机侧旋到车体系，直接整组取用 */
       motion_.setpoint = cmd_data_.navigation_velocity;
       switch (chassis_event_) {
         case ChassisMode::RELAX:
@@ -371,12 +358,6 @@ class Omni {
               max_v * cmd_data_.operator_input.z / PARAM.wheel_to_center;
           break;
 
-        /* 扭矩域：速度由积分自然形成，速度设定占位为 0，
-         * 旋转分量在逆运动学处改用实测值回填 */
-        case ChassisMode::ROTOR_VARIABLE:
-          motion_.setpoint.wz_rad_s = 0.0f;
-          break;
-
         case ChassisMode::ROTOR:
           motion_.setpoint.wz_rad_s =
               -static_cast<float>(max_v / PARAM.wheel_to_center);
@@ -403,7 +384,6 @@ class Omni {
           motion_.setpoint.vy_mps = 0.0f;
           break;
         case ChassisMode::ROTOR:
-        case ChassisMode::ROTOR_VARIABLE:
         case ChassisMode::FOLLOW: {
           float beta = motion_.yawmotor_angle;
           float cos_beta = cosf(beta);
@@ -432,7 +412,7 @@ class Omni {
       }
     }
 
-    /* 小陀螺模式按平移输入和功率状态动态压低转速 */
+    /* 旋转模式按平移输入和功率状态动态压低转速 */
     float rotor_translation_scale = 1.0f;
     if (chassis_event_ == ChassisMode::ROTOR) {
       float translation_magnitude =
@@ -565,9 +545,7 @@ class Omni {
     const float VY = motion_.setpoint.vy_mps;
     /* 扭矩域无旋转速度设定：旋转分量按实测回填，
      * 使轮速误差仅反映平移需求（功率分配语义正确） */
-    const float WZ = (chassis_event_ == ChassisMode::ROTOR_VARIABLE)
-                         ? motion_.measured.wz_rad_s
-                         : motion_.setpoint.wz_rad_s;
+    const float WZ = motion_.setpoint.wz_rad_s;
     output_.omega_setpoint[0] =
         (-INV_SQRT2 * VX - INV_SQRT2 * VY + WZ * PARAM.wheel_to_center) /
         PARAM.wheel_radius;
@@ -588,14 +566,6 @@ class Omni {
   void CalculateMotorCurrent() {
     if (chassis_event_ == ChassisMode::RELAX) {
       LostCtrl();
-    } else if (chassis_event_ == ChassisMode::ROTOR_VARIABLE) {
-      /* 扭矩域：无轮速闭环（与扭矩波形互斥），力设定 + 倾角前馈直通；
-       * 滑行相力设定为 0 → 请求电流≈0，摩擦自然减速 */
-      for (int i = 0; i < 4; i++) {
-        output_.torque_output[i] =
-            output_.force_setpoint[i] * PARAM.wheel_radius +
-            output_.feedforward_torque[i];
-      }
     } else {
       /* 轮速 PID 输出（仅本函数写读，局部化，不入实例） */
       float speed_pid_output[4];
@@ -691,41 +661,9 @@ class Omni {
     motion_.rotor_dynamic_scale = std::clamp(motion_.rotor_dynamic_scale,
                                              PARAM.rotor_omega_min_scale, 1.0f);
 
-    if (chassis_event_ != ChassisMode::ROTOR &&
-        chassis_event_ != ChassisMode::ROTOR_VARIABLE) {
+    if (chassis_event_ != ChassisMode::ROTOR) {
       motion_.rotor_dynamic_scale = 1.0f;
     }
-  }
-
-  /**
-   * @brief 变速小陀螺扭矩波形机（滞环：恒扭矩驱动 / 零扭矩滑行）
-   * @details 扭矩域控制，速度是力的积分，不做连续速度闭环。
-   *          ω 优先取本板 IMU 陀螺 z（轮速里程计在打滑时失真），
-   *          陀螺 100 ms 未更新则回退正解算值。转向与现有 ROTOR 一致（负向）。
-   */
-  void UpdateSpinCommand() {
-    const auto NOW = LibXR::Timebase::GetMicroseconds();
-    const float OMEGA_MEASURED = (NOW - last_gyro_time_ < 100000)
-                                     ? motion_.gyro_wz
-                                     : motion_.measured.wz_rad_s;
-    const float OMEGA_ABS = fabsf(OMEGA_MEASURED);
-
-    if (spin_.driving) {
-      if (OMEGA_ABS >= PARAM.spin_omega_hi_rad_s ||
-          OMEGA_ABS > PARAM.spin_omega_max_rad_s ||
-          NOW - spin_.phase_start_us >=
-              static_cast<LibXR::MicrosecondTimestamp>(
-                  PARAM.spin_drive_timeout_s * 1.0e6f)) {
-        spin_.driving = false; /* 到上限/超硬限/超时 → 滑行 */
-      }
-    } else {
-      if (OMEGA_ABS <= PARAM.spin_omega_lo_rad_s) {
-        spin_.driving = true; /* 降到下限 → 恒扭矩驱动 */
-        spin_.phase_start_us = NOW;
-      }
-    }
-
-    spin_.tau_cmd = spin_.driving ? -PARAM.spin_torque_amp_nm : 0.0f;
   }
 
   /**
@@ -739,16 +677,8 @@ class Omni {
     const float FORCE_Y = pid_velocity_y_.Calculate(
         motion_.setpoint.vy_mps, motion_.measured.vy_mps, dt_);
 
-    /* 扭矩域：跳过 pid_omega_（速度环与扭矩波形互斥），
-     * FORCE_Z 由波形机直接给定；速度域：pid_omega_ 闭环 */
-    float force_z;
-    if (chassis_event_ == ChassisMode::ROTOR_VARIABLE) {
-      UpdateSpinCommand();
-      force_z = spin_.tau_cmd / PARAM.wheel_to_center;
-    } else {
-      force_z = pid_omega_.Calculate(motion_.setpoint.wz_rad_s,
-                                     motion_.measured.wz_rad_s, dt_);
-    }
+    const float force_z = pid_omega_.Calculate(motion_.setpoint.wz_rad_s,
+                                              motion_.measured.wz_rad_s, dt_);
 
     /* 导航力前馈叠加在速度 PID 的力上，再统一做轮间分配与功率控制 */
     const CMD::NavigationFeedforward FF = ActiveFeedforward();
@@ -766,8 +696,7 @@ class Omni {
   /**
    * @brief 当前生效的导航力前馈（已限幅）
    * @details 仅导航来源、平移受控模式且 30 ms 内收到有效值时生效，否则为零。
-   *          RELAX/INDEPENDENT 与遥控来源不叠加；ROTOR_VARIABLE 的偏航为扭矩
-   *          波形机，不叠加偏航力矩。
+   *          RELAX/INDEPENDENT 与遥控来源不叠加。
    */
   CMD::NavigationFeedforward ActiveFeedforward() const {
     CMD::NavigationFeedforward ff{};
@@ -776,7 +705,6 @@ class Omni {
                        NOW - last_ff_time_ <= FF_TIMEOUT_US;
     const bool NAV_MODE = chassis_event_ == ChassisMode::NAVIGATION ||
                           chassis_event_ == ChassisMode::ROTOR ||
-                          chassis_event_ == ChassisMode::ROTOR_VARIABLE ||
                           chassis_event_ == ChassisMode::FOLLOW;
     if (!FRESH || !NAV_MODE ||
         cmd_data_.source != CMD::ChassisCommandSource::NAVIGATION) {
@@ -792,8 +720,7 @@ class Omni {
     }
     ff.fx_n = fx;
     ff.fy_n = fy;
-    if (chassis_event_ != ChassisMode::ROTOR_VARIABLE &&
-        std::isfinite(feedforward_.mz_nm)) {
+    if (std::isfinite(feedforward_.mz_nm)) {
       ff.mz_nm = std::clamp(feedforward_.mz_nm, -PARAM.ff_max_torque_nm,
                             PARAM.ff_max_torque_nm);
     }
@@ -877,7 +804,7 @@ class Omni {
     CMD::NavigationVelocity measured{};
     LibXR::EulerAngle<float> euler{};
     float yawmotor_angle = 0.0f;
-    float gyro_wz = 0.0f; /* 本板 IMU 陀螺 z（rad/s），变速小陀螺 ω 源 */
+    float gyro_wz = 0.0f; /* 本板 IMU 陀螺 z（rad/s） */
     float rotor_dynamic_scale = 1.0f; /* 功率相关动态缩放 */
   };
   MotionState motion_;
@@ -902,14 +829,6 @@ class Omni {
     PowerControlData limited{};
   };
   PowerStage power_;
-
-  /* 变速小陀螺（ROTOR_VARIABLE）扭矩波形机状态 */
-  struct SpinState {
-    bool driving = false; /* true=DRIVE 恒扭矩，false=COAST 滑行 */
-    LibXR::MicrosecondTimestamp phase_start_us = 0;
-    float tau_cmd = 0.0f; /* 底盘级偏航扭矩指令 N·m（含符号） */
-  };
-  SpinState spin_;
 
   LibXR::PID<float> pid_follow_;
   LibXR::PID<float> pid_velocity_x_;

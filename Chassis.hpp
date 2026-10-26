@@ -59,15 +59,6 @@ class Chassis {
     float rotor_buffer_low_j = 35.0f;
     float rotor_buffer_high_j = 70.0f;
     float rotor_scale_lpf_alpha = 0.2f;
-    /* 变速小陀螺（ROTOR_VARIABLE）：扭矩域滞环参数 */
-    float spin_torque_amp_nm = 15.0f;
-    float spin_omega_hi_rad_s = 14.0f;
-    float spin_omega_lo_rad_s = 6.0f;
-    float spin_omega_max_rad_s = 16.0f;
-    float spin_drive_timeout_s = 2.0f;
-    /* 导航力前馈限幅（仅 Omni 使用），0 关闭 */
-    float ff_max_force_n = 0.0f;
-    float ff_max_torque_nm = 0.0f;
   };
 
   Chassis(
@@ -89,12 +80,7 @@ class Chassis {
                                     .rotor_omega_min_scale = 0.55,
                                     .rotor_buffer_low_j = 35.0,
                                     .rotor_buffer_high_j = 70.0,
-                                    .rotor_scale_lpf_alpha = 0.2,
-                                    .spin_torque_amp_nm = 15.0,
-                                    .spin_omega_hi_rad_s = 14.0,
-                                    .spin_omega_lo_rad_s = 6.0,
-                                    .spin_omega_max_rad_s = 16.0,
-                                    .spin_drive_timeout_s = 2.0},
+                                    .rotor_scale_lpf_alpha = 0.2},
       LibXR::PID<float>::Param pid_follow_ = {.k = 1.0,
                                               .p = 20.0,
                                               .i = 0.0,
@@ -237,8 +223,6 @@ class Chassis {
     if constexpr (std::is_same<ChassisType, Omni>::value) {
       chassis_event_.Register(static_cast<uint32_t>(ChassisMode::NAVIGATION),
                               callback);
-      chassis_event_.Register(
-          static_cast<uint32_t>(ChassisMode::ROTOR_VARIABLE), callback);
     }
     /*
      * TRACK_START 只属于麦轮
@@ -277,12 +261,7 @@ class Chassis {
         chassis_param.rotor_omega_min_scale,
         chassis_param.rotor_buffer_low_j,
         chassis_param.rotor_buffer_high_j,
-        chassis_param.rotor_scale_lpf_alpha,
-        chassis_param.spin_torque_amp_nm,
-        chassis_param.spin_omega_hi_rad_s,
-        chassis_param.spin_omega_lo_rad_s,
-        chassis_param.spin_omega_max_rad_s,
-        chassis_param.spin_drive_timeout_s};
+        chassis_param.rotor_scale_lpf_alpha};
     if constexpr (std::is_same<ChassisType, Omni>::value) {
       param.ff_max_force_n = chassis_param.ff_max_force_n;
       param.ff_max_torque_nm = chassis_param.ff_max_torque_nm;
