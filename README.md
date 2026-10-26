@@ -26,127 +26,39 @@
     xrobot_gen_main
     cube-cmake --build /home/leo/Documents/bsp-dev-c/build/debug --
 
-## 4. 配置示例（YAML）
-module: Chassis
-entry_header: Modules/Chassis/Chassis.hpp
-constructor_args:
-  - motor_wheel_0: '@&motor_wheel_0'
-  - motor_wheel_1: '@&motor_wheel_1'
-  - motor_wheel_2: '@&motor_wheel_2'
-  - motor_wheel_3: '@&motor_wheel_3'
-  - motor_steer_0: '@&motor_steer_0'
-  - motor_steer_1: '@&motor_steer_1'
-  - motor_steer_2: '@&motor_steer_2'
-  - motor_steer_3: '@&motor_steer_3'
-  - cmd: '@&cmd'
-  - power_control: '@&power_control'
-  - task_stack_depth: 4096
-  - ChassisParam:
-      wheel_radius: 0.065
-      wheel_to_center: 0.26
+## 4. 参数配置（XRobot 1.0.1）
+
+`Chassis::ChassisParam` 统一包含 22 项参数。以下为底盘实例的 `args` 配置片段，完整电机和 PID 参数见工程的 `User/RobotConfig/sentry_chassis.yaml`：
+
+```yaml
+  - chassis_param:
+      wheel_radius: 0.075
+      wheel_to_center: 0.245
+      reduction_ratio: 19.2
+      rotor_speed_scale: 0.80
+      max_acceleration_mps2: 2.0
+      max_angular_acceleration_rad_s2: 4.0
+      max_jerk_mps3: 10.0
+      max_angular_jerk_rad_s3: 20.0
+      mass_kg: 28.0
+      yaw_inertia_kg_m2: 0.58
       gravity_height: 0.0
-      reductionratio: 15.7647
       wheel_resistance: 0.0
       error_compensation: 0.0
-      gravity: 83.692
-  - pid_follow_:
-      k: 1.0
-      p: 20.0
-      i: 0.0
-      d: 0.0
-      i_limit: 0.0
-      out_limit: 30.0
-      cycle: true
-  - pid_velocity_x_:
-      k: 1.0
-      p: 20.0
-      i: 0.0
-      d: 0.0
-      i_limit: 0.0
-      out_limit: 30.0
-      cycle: false
-  - pid_velocity_y_:
-      k: 1.0
-      p: 20.0
-      i: 0.0
-      d: 0.0
-      i_limit: 0.0
-      out_limit: 30.0
-      cycle: false
-  - pid_omega_:
-      k: 1.0
-      p: 20.0
-      i: 0.0
-      d: 0.0
-      i_limit: 0.0
-      out_limit: 30.0
-      cycle: false
-  - pid_wheel_speed_0_:
-      k: 1.0
-      p: 0.3
-      i: 0.0
-      d: 0.0
-      i_limit: 0.0
-      out_limit: 5.0
-      cycle: false
-  - pid_wheel_speed_1_:
-      k: 1.0
-      p: 0.3
-      i: 0.0
-      d: 0.0
-      i_limit: 0.0
-      out_limit: 5.0
-      cycle: false
-  - pid_wheel_speed_2_:
-      k: 1.0
-      p: 0.3
-      i: 0.0
-      d: 0.0
-      i_limit: 0.0
-      out_limit: 5.0
-      cycle: false
-  - pid_wheel_speed_3_:
-      k: 1.0
-      p: 0.3
-      i: 0.0
-      d: 0.0
-      i_limit: 0.0
-      out_limit: 5.0
-      cycle: false
-  - pid_steer_angle_0_:
-      k: 1.0
-      p: 0.0
-      i: 0.0
-      d: 0.0
-      i_limit: 0.0
-      out_limit: 0.0
-      cycle: false
-  - pid_steer_angle_1_:
-      k: 1.0
-      p: 0.0
-      i: 0.0
-      d: 0.0
-      i_limit: 0.0
-      out_limit: 0.0
-      cycle: false
-  - pid_steer_angle_2_:
-      k: 1.0
-      p: 0.0
-      i: 0.0
-      d: 0.0
-      i_limit: 0.0
-      out_limit: 0.0
-      cycle: false
-  - pid_steer_angle_3_:
-      k: 1.0
-      p: 0.0
-      i: 0.0
-      d: 0.0
-      i_limit: 0.0
-      out_limit: 0.0
-      cycle: false
-template_args:
-  - ChassisType: Omni
+      gravity: 0.0
+      length: 0.0
+      width: 0.0
+      rotor_omega_min_scale: 0.55
+      rotor_buffer_low_j: 35.0
+      rotor_buffer_high_j: 70.0
+      rotor_scale_lpf_alpha: 0.2
+      ff_max_force_n: 0.0
+      ff_max_torque_nm: 0.0
+```
+
+所有字段都填写在 `chassis_param`。默认关闭阻力/倾斜补偿，保留小陀螺能量缩放的 `0.55`、`35/70 J`、`0.2` 设置。XRobot 1.0.1 要求结构体映射字段完整匹配。
+
+Omni 前馈限幅默认由 `sqrt(2)*mass_kg*max_acceleration_mps2` 与 `yaw_inertia_kg_m2*max_angular_acceleration_rad_s2` 推导。`chassis_param` 中的 `ff_max_force_n` / `ff_max_torque_nm` 为 0 时自动推导，正数指定独立限幅，负数关闭对应前馈。较小正限幅同时收紧规划加速度。
 
 ## 5. 依赖与硬件
 Required Hardware:

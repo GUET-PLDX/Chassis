@@ -15,7 +15,9 @@ depends:
 === END MANIFEST === */
 // clang-format on
 
+#include <cmath>
 #include <cstdint>
+#include <numbers>
 #include <type_traits>
 
 /* 功率控制数组按当前最大底盘需求预留 */
@@ -47,18 +49,27 @@ class Chassis {
   struct ChassisParam {
     float wheel_radius = 0.0f;
     float wheel_to_center = 0.0f;
-    float gravity_height = 0.0f;
     float reduction_ratio = 0.0f;
+    float rotor_speed_scale = 1.0f;
+    float max_acceleration_mps2 = 2.0f;
+    float max_angular_acceleration_rad_s2 = 4.0f;
+    float max_jerk_mps3 = 10.0f;
+    float max_angular_jerk_rad_s3 = 20.0f;
+    float mass_kg = 0.0f;
+    float yaw_inertia_kg_m2 = 0.0f;
+    float gravity_height = 0.0f;
     float wheel_resistance = 0.0f;
     float error_compensation = 0.0f;
     float gravity = 0.0f;
     float length = 0.0f;
     float width = 0.0f;
-    float rotor_speed_scale = 1.0f;
     float rotor_omega_min_scale = 0.55f;
     float rotor_buffer_low_j = 35.0f;
     float rotor_buffer_high_j = 70.0f;
     float rotor_scale_lpf_alpha = 0.2f;
+    /* 0 按质量/惯量和规划加速度推导，正数覆盖，负值关闭。 */
+    float ff_max_force_n = 0.0f;
+    float ff_max_torque_nm = 0.0f;
   };
 
   Chassis(
@@ -69,18 +80,8 @@ class Chassis {
       uint32_t task_stack_depth = 1536,
       ChassisParam chassis_param = {.wheel_radius = 0.065,
                                     .wheel_to_center = 0.26,
-                                    .gravity_height = 0.0,
                                     .reduction_ratio = 15.7647,
-                                    .wheel_resistance = 0.0,
-                                    .error_compensation = 0.0,
-                                    .gravity = 230,
-                                    .length = 0.0,
-                                    .width = 0.0,
-                                    .rotor_speed_scale = 0.95,
-                                    .rotor_omega_min_scale = 0.55,
-                                    .rotor_buffer_low_j = 35.0,
-                                    .rotor_buffer_high_j = 70.0,
-                                    .rotor_scale_lpf_alpha = 0.2},
+                                    .rotor_speed_scale = 0.95},
       LibXR::PID<float>::Param pid_follow_ = {.k = 1.0,
                                               .p = 20.0,
                                               .i = 0.0,
@@ -244,27 +245,46 @@ class Chassis {
   /** @brief 获取底盘实现的实际模式。 */
   ChassisMode GetMode() { return chassis_.GetMode(); }
 
-  /** @brief 外壳参数转为具体底盘参数；力前馈限幅只有 Omni 实现。 */
+  /** @brief 外壳参数转为具体底盘参数；Omni 默认由运动约束推导前馈限幅。 */
   static typename ChassisType::ChassisParam MakeParam(
       const ChassisParam& chassis_param) {
     typename ChassisType::ChassisParam param{
-        chassis_param.wheel_radius,
-        chassis_param.wheel_to_center,
-        chassis_param.gravity_height,
-        chassis_param.reduction_ratio,
-        chassis_param.wheel_resistance,
-        chassis_param.error_compensation,
-        chassis_param.gravity,
-        chassis_param.length,
-        chassis_param.width,
-        chassis_param.rotor_speed_scale,
-        chassis_param.rotor_omega_min_scale,
-        chassis_param.rotor_buffer_low_j,
-        chassis_param.rotor_buffer_high_j,
-        chassis_param.rotor_scale_lpf_alpha};
+        .wheel_radius = chassis_param.wheel_radius,
+        .wheel_to_center = chassis_param.wheel_to_center,
+        .gravity_height = chassis_param.gravity_height,
+        .reduction_ratio = chassis_param.reduction_ratio,
+        .wheel_resistance = chassis_param.wheel_resistance,
+        .error_compensation = chassis_param.error_compensation,
+        .gravity = chassis_param.gravity,
+        .length = chassis_param.length,
+        .width = chassis_param.width,
+        .rotor_speed_scale = chassis_param.rotor_speed_scale,
+        .rotor_omega_min_scale = chassis_param.rotor_omega_min_scale,
+        .rotor_buffer_low_j = chassis_param.rotor_buffer_low_j,
+        .rotor_buffer_high_j = chassis_param.rotor_buffer_high_j,
+        .rotor_scale_lpf_alpha = chassis_param.rotor_scale_lpf_alpha};
     if constexpr (std::is_same<ChassisType, Omni>::value) {
-      param.ff_max_force_n = chassis_param.ff_max_force_n;
-      param.ff_max_torque_nm = chassis_param.ff_max_torque_nm;
+      const auto positive = [](float value) {
+        return std::isfinite(value) && value > 0.0f ? value : 0.0f;
+      };
+      // X/Y 分别限加速度，因此平移合力限值带 sqrt(2)。
+      param.ff_max_force_n = positive(
+          chassis_param.ff_max_force_n == 0.0f
+              ? std::numbers::sqrt2_v<float> * positive(chassis_param.mass_kg) *
+                    positive(chassis_param.max_acceleration_mps2)
+              : chassis_param.ff_max_force_n);
+      param.ff_max_torque_nm = positive(
+          chassis_param.ff_max_torque_nm == 0.0f
+              ? positive(chassis_param.yaw_inertia_kg_m2) *
+                    positive(chassis_param.max_angular_acceleration_rad_s2)
+              : chassis_param.ff_max_torque_nm);
+      param.max_acceleration_mps2 = chassis_param.max_acceleration_mps2;
+      param.max_angular_acceleration_rad_s2 =
+          chassis_param.max_angular_acceleration_rad_s2;
+      param.max_jerk_mps3 = chassis_param.max_jerk_mps3;
+      param.max_angular_jerk_rad_s3 = chassis_param.max_angular_jerk_rad_s3;
+      param.mass_kg = chassis_param.mass_kg;
+      param.yaw_inertia_kg_m2 = chassis_param.yaw_inertia_kg_m2;
     }
     return param;
   }
