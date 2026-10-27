@@ -28,7 +28,7 @@
 
 ## 4. 参数配置（XRobot 1.0.1）
 
-`Chassis::ChassisParam` 统一包含 22 项参数。以下为底盘实例的 `args` 配置片段，完整电机和 PID 参数见工程的 `User/RobotConfig/sentry_chassis.yaml`：
+`Chassis::ChassisParam` 统一包含 20 项参数。以下为底盘实例的 `args` 配置片段，完整电机和 PID 参数见工程的 `User/RobotConfig/sentry_chassis.yaml`：
 
 ```yaml
   - chassis_param:
@@ -38,8 +38,6 @@
       rotor_speed_scale: 0.80
       max_acceleration_mps2: 2.0
       max_angular_acceleration_rad_s2: 4.0
-      max_jerk_mps3: 10.0
-      max_angular_jerk_rad_s3: 20.0
       mass_kg: 28.0
       yaw_inertia_kg_m2: 0.58
       gravity_height: 0.0
@@ -58,7 +56,7 @@
 
 所有字段都填写在 `chassis_param`。默认关闭阻力/倾斜补偿，保留小陀螺能量缩放的 `0.55`、`35/70 J`、`0.2` 设置。XRobot 1.0.1 要求结构体映射字段完整匹配。
 
-Omni 前馈限幅默认由 `sqrt(2)*mass_kg*max_acceleration_mps2` 与 `yaw_inertia_kg_m2*max_angular_acceleration_rad_s2` 推导。`chassis_param` 中的 `ff_max_force_n` / `ff_max_torque_nm` 为 0 时自动推导，正数指定独立限幅，负数关闭对应前馈。较小正限幅同时收紧规划加速度。
+Omni 前馈限幅默认由 `sqrt(2)*mass_kg*max_acceleration_mps2` 与 `yaw_inertia_kg_m2*max_angular_acceleration_rad_s2` 推导。`chassis_param` 中的 `ff_max_force_n` / `ff_max_torque_nm` 为 0 时自动推导，正数指定独立限幅，负数关闭对应前馈。质量、惯量和加速度参数仅用于推导导航驱动力限幅。
 
 ## 5. 依赖与硬件
 Required Hardware:
@@ -81,3 +79,13 @@ Modules/Chassis/Chassis.hpp
 使用 xrobot 1.0.1 的 `module` / 有序 `args`；构造函数显式注入外设与服务，实例按依赖顺序创建。参数名和顺序以头文件中的构造函数为准，固件示例见 `User/RobotConfig/`。
 
 保留 PLDX 控制、协议、超时与离线保护。 `OnMonitor()` 由生成的监控循环直接调用。
+
+## MPC navigation drive
+
+Navigation-source planar commands are chassis-frame Fx/Fy/Mz from `chassis_ff`.
+Fx/Fy pass directly through force allocation. Navigation translation bypasses
+chassis velocity feedback, wheel velocity PID and local compensation additions.
+NAVIGATION mode also executes Mz directly; ROTOR/FOLLOW generate local yaw control.
+External force/torque caps and motor current/power limits remain active. A stale
+wrench produces zero drive force. Operator velocity targets and ROTOR/FOLLOW yaw targets enter their velocity
+PIDs directly in the current cycle.

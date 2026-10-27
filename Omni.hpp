@@ -51,59 +51,8 @@ class Omni {
     /* 底盘前馈限幅；0 关闭对应分量。 */
     float ff_max_force_n = 0.0f;
     float ff_max_torque_nm = 0.0f;
-    /* S.c 速度参考规划的逐轴加速度上限及 jerk 尺度。 */
-    float max_acceleration_mps2 = 2.0f;
-    float max_angular_acceleration_rad_s2 = 4.0f;
-    /* 原算法动态 jerk 边界尺度，幅值最高为该值的两倍。 */
-    float max_jerk_mps3 = 10.0f;
-    float max_angular_jerk_rad_s3 = 20.0f;
-    /* 整车运行质量 kg、绕质心的偏航惯量 kg*m^2；待标定时为 0。 */
-    float mass_kg = 0.0f;
-    float yaw_inertia_kg_m2 = 0.0f;
   };
 
-  struct DesiredAcceleration {
-    float ax_mps2 = 0.0f;
-    float ay_mps2 = 0.0f;
-    float alpha_rad_s2 = 0.0f;
-  };
-
-  struct SecondOrderSetFollow {
-    float amax = 0.0f;
-    float vmax = 0.0f;
-    float dt = 0.0f;
-    float p = 0.0f;
-    float v = 0.0f;
-    float a = 0.0f;
-    float a_p = 0.0f;
-    float a_n = 0.0f;
-    float k1 = 0.0f;
-    float k2 = 0.0f;
-  };
-
-  /* 平面刚体、参考点为质心：输入为惯性加速度在车体系中的分量。 */
-  static CMD::NavigationFeedforward AccelerationToWrench(
-      const DesiredAcceleration& acceleration, float mass_kg,
-      float yaw_inertia_kg_m2) {
-    CMD::NavigationFeedforward wrench{};
-    if (std::isfinite(mass_kg) && mass_kg > 0.0f &&
-        std::isfinite(acceleration.ax_mps2) &&
-        std::isfinite(acceleration.ay_mps2)) {
-      wrench.fx_n = mass_kg * acceleration.ax_mps2;
-      wrench.fy_n = mass_kg * acceleration.ay_mps2;
-      wrench.valid = true;
-    }
-    if (std::isfinite(yaw_inertia_kg_m2) && yaw_inertia_kg_m2 > 0.0f &&
-        std::isfinite(acceleration.alpha_rad_s2)) {
-      wrench.mz_nm = yaw_inertia_kg_m2 * acceleration.alpha_rad_s2;
-      wrench.valid = true;
-    }
-    if (!std::isfinite(wrench.fx_n) || !std::isfinite(wrench.fy_n) ||
-        !std::isfinite(wrench.mz_nm)) {
-      return {};
-    }
-    return wrench;
-  }
   enum class ChassisMode : uint8_t {
     RELAX,
     INDEPENDENT,
@@ -245,8 +194,6 @@ class Omni {
     /* 底盘倾角直接取自本板 AHRS，不再跨板取云台板 IMU 姿态做反推 */
     LibXR::Topic::ASyncSubscriber<LibXR::EulerAngle<float>> chassis_euler_suber(
         "chassis_euler");
-    LibXR::Topic::ASyncSubscriber<Eigen::Matrix<float, 3, 1>> gyro_suber(
-        "chassis_gyro");
     LibXR::Topic::ASyncSubscriber<float> yawmotor_angle_suber("yawmotor_angle");
     LibXR::Topic::ASyncSubscriber<CMD::NavigationFeedforward> ff_suber(
         "chassis_ff");
@@ -255,7 +202,6 @@ class Omni {
     referee_suber.StartWaiting();
     chassis_euler_suber.StartWaiting();
     yawmotor_angle_suber.StartWaiting();
-    gyro_suber.StartWaiting();
     ff_suber.StartWaiting();
     omni->last_online_time_ = LibXR::Timebase::GetMicroseconds();
     auto last_time = LibXR::Timebase::GetMilliseconds();
@@ -281,11 +227,6 @@ class Omni {
         omni->motion_.yawmotor_angle = yawmotor_angle_suber.GetData();
         yawmotor_angle_suber.StartWaiting();
       }
-      if (gyro_suber.Available()) {
-        omni->motion_.gyro_wz = gyro_suber.GetData().z();
-        omni->last_gyro_time_ = LibXR::Timebase::GetMicroseconds();
-        gyro_suber.StartWaiting();
-      }
       if (ff_suber.Available()) {
         omni->feedforward_ = ff_suber.GetData();
         omni->last_ff_time_ = LibXR::Timebase::GetMicroseconds();
@@ -295,7 +236,6 @@ class Omni {
       omni->Update();
       omni->UpdateCMD();
       omni->SelfResolution();
-      omni->UpdateInertialReference();
       omni->InverseKinematicsSolution();
       omni->DynamicInverseSolution();
       omni->FeedForward();
@@ -334,7 +274,7 @@ class Omni {
   /** @brief 轮速正解算的车体系实测速度快照（与 setpoint
    * 同轴同号），供双板回传。 */
   struct MeasuredState {
-    CMD::NavigationVelocity velocity{};
+    CMD::ChassisVelocity velocity{};
     bool wheel_online[4]{};
     ChassisMode mode = ChassisMode::RELAX;
     LibXR::MicrosecondTimestamp sample_time_us = 0; /* 0 表示尚未解算 */
@@ -378,7 +318,7 @@ class Omni {
         PARAM.wheel_radius * static_cast<float>(OMNI_MOTOR_MAX_OMEGA);
 
     if (cmd_data_.source == CMD::ChassisCommandSource::NAVIGATION) {
-      motion_.setpoint = cmd_data_.navigation_velocity;
+      motion_.setpoint = {};
       switch (chassis_event_) {
         case ChassisMode::RELAX:
           motion_.setpoint.vx_mps = 0.0F;
@@ -633,17 +573,23 @@ class Omni {
       /* 轮速 PID 输出（仅本函数写读，局部化，不入实例） */
       float speed_pid_output[4];
       for (int i = 0; i < 4; i++) {
-        speed_pid_output[i] = pid_wheel_speed_[i].Calculate(
-            output_.omega_setpoint[i],
-            wheel_.feedback[i].omega / PARAM.reduction_ratio, dt_);
+        speed_pid_output[i] =
+            cmd_data_.source == CMD::ChassisCommandSource::NAVIGATION
+                ? 0.0f
+                : pid_wheel_speed_[i].Calculate(
+                      output_.omega_setpoint[i],
+                      wheel_.feedback[i].omega / PARAM.reduction_ratio, dt_);
       }
 
       /* 合成动力学输出和上坡前馈 */
       for (int i = 0; i < 4; i++) {
         output_.torque_output[i] =
             output_.force_setpoint[i] * PARAM.wheel_radius +
-            speed_pid_output[i] + output_.feedforward_torque[i] +
-            ResistanceTorque(output_.omega_setpoint[i]);
+            speed_pid_output[i] +
+            (cmd_data_.source == CMD::ChassisCommandSource::NAVIGATION
+                 ? 0.0f
+                 : output_.feedforward_torque[i] +
+                       ResistanceTorque(output_.omega_setpoint[i]));
       }
     }
   }
@@ -664,8 +610,11 @@ class Omni {
 
     float wheel_speed_error[4];
     for (int i = 0; i < 4; i++) {
-      wheel_speed_error[i] = output_.omega_setpoint[i] -
-                             wheel_.feedback[i].omega / PARAM.reduction_ratio;
+      wheel_speed_error[i] =
+          cmd_data_.source == CMD::ChassisCommandSource::NAVIGATION
+              ? 0.0f
+              : output_.omega_setpoint[i] -
+                    wheel_.feedback[i].omega / PARAM.reduction_ratio;
       power_.motor_data_.output_current_3508[i] =
           std::clamp(output_.torque_output[i] * M3508_NM_TO_LSB_RATIO /
                          PARAM.reduction_ratio,
@@ -729,285 +678,29 @@ class Omni {
     }
   }
 
-  bool LocalTranslationFeedforwardEnabled() const {
-    return std::isfinite(PARAM.mass_kg) && PARAM.mass_kg > 0.0f &&
-           std::isfinite(PARAM.ff_max_force_n) && PARAM.ff_max_force_n > 0.0f;
-  }
-
-  bool LocalYawFeedforwardEnabled() const {
-    return std::isfinite(PARAM.yaw_inertia_kg_m2) &&
-           PARAM.yaw_inertia_kg_m2 > 0.0f &&
-           std::isfinite(PARAM.ff_max_torque_nm) &&
-           PARAM.ff_max_torque_nm > 0.0f;
-  }
-
-  static bool InitSProfile(SecondOrderSetFollow& planner, float vmax,
-                           float amax, float dt, float position,
-                           float velocity) {
-    if (!std::isfinite(vmax) || vmax <= 0.0f || !std::isfinite(amax) ||
-        amax <= 0.0f || !std::isfinite(dt) || dt <= 0.0f ||
-        !std::isfinite(position) || !std::isfinite(velocity)) {
-      return false;
-    }
-    planner.amax = amax;
-    planner.vmax = vmax;
-    planner.dt = dt;
-    planner.p = position;
-    planner.v = std::clamp(velocity, -vmax, vmax);
-    planner.a = 0.0f;
-    planner.k1 = amax / 24.0f;
-    planner.k2 = 24.0f / vmax;
-    planner.a_p = amax;
-    planner.a_n = -amax;
-    return true;
-  }
-
-  static void UpdateSProfileAcceleration(SecondOrderSetFollow& planner) {
-    planner.a_p = planner.k1 * (24.0f - planner.k2 * planner.v);
-    planner.a_n = -planner.k1 * (24.0f + planner.k2 * planner.v);
-  }
-
-  /* 分段多项式及 t1/tv/t2 计算来自 Reference/S.c。 */
-  static bool CalculateSProfile(SecondOrderSetFollow& planner, float ps,
-                                float vs) {
-    if (!std::isfinite(ps) || !std::isfinite(vs) || !std::isfinite(planner.p) ||
-        !std::isfinite(planner.v) || !std::isfinite(planner.dt) ||
-        planner.dt <= 0.0f || !std::isfinite(planner.vmax) ||
-        planner.vmax <= 0.0f || !std::isfinite(planner.amax) ||
-        planner.amax <= 0.0f || !std::isfinite(planner.a_p) ||
-        !std::isfinite(planner.a_n) || fabsf(vs) >= planner.vmax) {
-      return false;
-    }
-    const SecondOrderSetFollow PREVIOUS = planner;
-    // S.c 的动态边界在饱和点为零；仅求解分母使用正数下限。
-    float t1 = 0, t2 = 0;
-    float vm = planner.vmax;
-    float a_p = std::max(planner.a_p, planner.amax * 1e-6f);
-    float a_n = std::min(planner.a_n, -planner.amax * 1e-6f);
-    float a = a_p;
-
-    float delta_s = ps - planner.p;
-
-    float vm_2 = vm * vm;
-    float v_2 = planner.v * planner.v;
-    float vs_2 = vs * vs;
-
-    float tv = (delta_s + vs * ((vm - planner.v) / a + (vm - vs) / a) -
-                (vm_2 - v_2) / (2 * a) - (vm_2 - vs_2) / (2 * a)) /
-               (vm - vs);
-
-    if (tv < 0) {
-      a = -a_n;
-
-      tv = (delta_s + vs * ((-vm - planner.v) / -a + (-vm - vs) / -a) -
-            (vm_2 - v_2) / (2 * -a) - (vm_2 - vs_2) / (2 * -a)) /
-           (-vm - vs);
-
-      if (tv >= 0) {
-        vm = -vm;
-        a = -a;
-      } else {
-        a = a_p;
-      }
-    }
-
-    if (tv < 0) {
-      float temp1 = (v_2 - 2 * planner.v * vs + vs_2 + 2 * a * delta_s);
-      float temp2 =
-          -(-v_2 + 2 * planner.v * vs - vs_2 + 2 * fabsf(a_n) * delta_s);
-
-      if (temp1 < temp2) {
-        float temp = temp2;
-        a = -a_n;
-
-        t1 = (planner.v - vs + sqrtf(2 * a * a * temp) / (2 * a)) / a;
-        t2 = sqrtf(2 * a * a * temp) / (2 * a * a);
-        a = -a;
-      } else {
-        float temp = temp1;
-        t1 = (vs - planner.v + sqrtf(2 * a * a * temp) / (2 * a)) / a;
-        t2 = sqrtf(2 * a * a * temp) / (2 * a * a);
-      }
-
-      t1 = (t1 < 0) ? 0 : t1;
-      t2 = (t2 < 0) ? 0 : t2;
-
-      if (planner.dt <= t1) {
-        planner.p = planner.p + planner.v * planner.dt +
-                    a * planner.dt * planner.dt / 2;
-        planner.v = planner.v + a * planner.dt;
-        planner.a = a;
-      } else if (planner.dt <= t2 + t1) {
-        float t = planner.dt - t1;
-        planner.p = planner.p + planner.v * t1 + a * t1 * t1 / 2 +
-                    (planner.v + a * t1) * t - a * t * t / 2;
-        planner.v = planner.v + a * t1 - a * t;
-        planner.a = -a;
-      } else {
-        planner.v = vs;
-        planner.p = ps + vs * planner.dt;
-        planner.a = 0;
-      }
-    } else {
-      t1 = (vm - planner.v) / a;
-      t2 = (vm - vs) / a;
-      t1 = (t1 < 0) ? 0 : t1;
-      t2 = (t2 < 0) ? 0 : t2;
-
-      if (planner.dt <= t1) {
-        planner.p = planner.p + planner.v * planner.dt +
-                    a * planner.dt * planner.dt / 2;
-        planner.v = planner.v + a * planner.dt;
-        planner.a = a;
-      } else if (planner.dt <= t1 + tv) {
-        float t = planner.dt - t1;
-        planner.p = planner.p + planner.v * t1 + a * t1 * t1 / 2 + vm * t;
-        planner.v = vm;
-        planner.a = 0;
-      } else if (planner.dt <= t1 + tv + t2) {
-        float t = planner.dt - t1 - tv;
-        planner.p = planner.p + (vm_2 - v_2) / (2 * a) + tv * vm + vm * t -
-                    a * t * t / 2;
-        planner.v = vm - a * t;
-        planner.a = -a;
-      } else {
-        planner.v = vs;
-        planner.p = ps + vs * planner.dt;
-        planner.a = 0;
-      }
-    }
-
-    if (fabsf(planner.v) > fabsf(vm)) {
-      planner.v = fabsf(vm) * ((planner.v > 0) ? 1 : -1);
-    }
-
-    if (!std::isfinite(planner.p) || !std::isfinite(planner.v) ||
-        !std::isfinite(planner.a)) {
-      planner = PREVIOUS;
-      return false;
-    }
-    return true;
-  }
-
-  static void RotateSProfile(SecondOrderSetFollow& x, SecondOrderSetFollow& y,
-                             float angle) {
-    const float COS = cosf(angle);
-    const float SIN = sinf(angle);
-    const float PX = COS * x.p + SIN * y.p;
-    const float PY = -SIN * x.p + COS * y.p;
-    const float VX = COS * x.v + SIN * y.v;
-    const float VY = -SIN * x.v + COS * y.v;
-    x.p = PX;
-    y.p = PY;
-    x.v = VX;
-    y.v = VY;
-  }
-
-  /* S.c 的 p/v/a 分别映射为底盘速度/加速度/jerk；末加速度为 0。
-   * 参数 vmax 为最大加速度，amax 为 jerk 尺度，保留速度相关动态边界。 */
-  void UpdateInertialReference() {
-    motion_.acceleration = {};
-    output_.inertial_feedforward = {};
-    const bool TRANSLATION = LocalTranslationFeedforwardEnabled();
-    const bool YAW = LocalYawFeedforwardEnabled();
-    if (chassis_event_ == ChassisMode::RELAX || !std::isfinite(dt_) ||
-        dt_ <= 0.0f || dt_ > static_cast<float>(FF_TIMEOUT_US) * 1.0e-6f ||
-        !std::isfinite(motion_.setpoint.vx_mps) ||
-        !std::isfinite(motion_.setpoint.vy_mps) ||
-        !std::isfinite(motion_.setpoint.wz_rad_s) ||
-        !std::isfinite(motion_.measured.vx_mps) ||
-        !std::isfinite(motion_.measured.vy_mps) ||
-        !std::isfinite(motion_.measured.wz_rad_s)) {
-      motion_.reference_initialized = false;
-      motion_.setpoint = chassis_event_ == ChassisMode::RELAX
-                             ? CMD::NavigationVelocity{}
-                             : motion_.measured;
-      return;
-    }
-    if (!motion_.reference_initialized ||
-        motion_.reference_source != cmd_data_.source ||
-        motion_.reference_mode != chassis_event_) {
-      float max_acceleration = PARAM.max_acceleration_mps2;
-      if (TRANSLATION) {
-        // Per-axis bounds ensure the translation resultant is within Fmax/m.
-        max_acceleration = std::min(
-            max_acceleration, PARAM.ff_max_force_n / (PARAM.mass_kg * SQRT2));
-      }
-      float max_angular_acceleration = PARAM.max_angular_acceleration_rad_s2;
-      if (YAW) {
-        max_angular_acceleration =
-            std::min(max_angular_acceleration,
-                     PARAM.ff_max_torque_nm / PARAM.yaw_inertia_kg_m2);
-      }
-      if (!InitSProfile(motion_.planner_x, max_acceleration,
-                        PARAM.max_jerk_mps3, dt_, motion_.measured.vx_mps,
-                        0.0f) ||
-          !InitSProfile(motion_.planner_y, max_acceleration,
-                        PARAM.max_jerk_mps3, dt_, motion_.measured.vy_mps,
-                        0.0f) ||
-          !InitSProfile(motion_.planner_wz, max_angular_acceleration,
-                        PARAM.max_angular_jerk_rad_s3, dt_,
-                        motion_.measured.wz_rad_s, 0.0f)) {
-        motion_.reference_initialized = false;
-        motion_.setpoint = motion_.measured;
-        return;
-      }
-      motion_.reference_source = cmd_data_.source;
-      motion_.reference_mode = chassis_event_;
-      motion_.reference_initialized = true;
-    }
-    const auto NOW = LibXR::Timebase::GetMicroseconds();
-    const float WZ =
-        (last_gyro_time_ != 0U && NOW - last_gyro_time_ < 100000U &&
-         std::isfinite(motion_.gyro_wz))
-            ? motion_.gyro_wz
-            : motion_.measured.wz_rad_s;
-    RotateSProfile(motion_.planner_x, motion_.planner_y, WZ * dt_);
-    motion_.planner_x.dt = dt_;
-    motion_.planner_y.dt = dt_;
-    motion_.planner_wz.dt = dt_;
-    UpdateSProfileAcceleration(motion_.planner_x);
-    UpdateSProfileAcceleration(motion_.planner_y);
-    UpdateSProfileAcceleration(motion_.planner_wz);
-    if (!CalculateSProfile(motion_.planner_x, motion_.setpoint.vx_mps, 0.0f) ||
-        !CalculateSProfile(motion_.planner_y, motion_.setpoint.vy_mps, 0.0f) ||
-        !CalculateSProfile(motion_.planner_wz, motion_.setpoint.wz_rad_s,
-                           0.0f)) {
-      motion_.reference_initialized = false;
-      motion_.setpoint = motion_.measured;
-      return;
-    }
-    motion_.setpoint = {motion_.planner_x.p, motion_.planner_y.p,
-                        motion_.planner_wz.p};
-    motion_.acceleration = {motion_.planner_x.v, motion_.planner_y.v,
-                            motion_.planner_wz.v};
-    output_.inertial_feedforward = AccelerationToWrench(
-        motion_.acceleration, TRANSLATION ? PARAM.mass_kg : 0.0f,
-        YAW ? PARAM.yaw_inertia_kg_m2 : 0.0f);
-  }
-
-  /** @brief 速度反馈与惯性前馈合成，再统一分配四轮驱动力。 */
+  /** @brief 合成本地速度反馈或导航驱动力，再分配四轮驱动力。 */
   void DynamicInverseSolution() {
-    const float FORCE_X = pid_velocity_x_.Calculate(
-        motion_.setpoint.vx_mps, motion_.measured.vx_mps, dt_);
-    const float FORCE_Y = pid_velocity_y_.Calculate(
-        motion_.setpoint.vy_mps, motion_.measured.vy_mps, dt_);
-
-    float force_z = pid_omega_.Calculate(motion_.setpoint.wz_rad_s,
-                                         motion_.measured.wz_rad_s, dt_);
-
-    /* 本地模型按轴替代导航的绝对力前馈，避免惯性力重复叠加。 */
-    CMD::NavigationFeedforward FF = ActiveFeedforward();
-    if (LocalTranslationFeedforwardEnabled()) {
-      FF.fx_n = output_.inertial_feedforward.fx_n;
-      FF.fy_n = output_.inertial_feedforward.fy_n;
-    }
-    if (LocalYawFeedforwardEnabled()) {
-      FF.mz_nm = output_.inertial_feedforward.mz_nm;
-    }
-    const float FX = FORCE_X + FF.fx_n;
-    const float FY = FORCE_Y + FF.fy_n;
-    force_z += FF.mz_nm / PARAM.wheel_to_center;
+    const bool NAVIGATION =
+        cmd_data_.source == CMD::ChassisCommandSource::NAVIGATION;
+    const bool LOCAL_YAW = !NAVIGATION ||
+                           chassis_event_ == ChassisMode::ROTOR ||
+                           chassis_event_ == ChassisMode::FOLLOW;
+    const auto FF =
+        NAVIGATION ? ActiveFeedforward() : CMD::NavigationFeedforward{};
+    const float FX = FF.fx_n + (NAVIGATION ? 0.0f
+                                           : pid_velocity_x_.Calculate(
+                                                 motion_.setpoint.vx_mps,
+                                                 motion_.measured.vx_mps, dt_));
+    const float FY = FF.fy_n + (NAVIGATION ? 0.0f
+                                           : pid_velocity_y_.Calculate(
+                                                 motion_.setpoint.vy_mps,
+                                                 motion_.measured.vy_mps, dt_));
+    const float MZ = LOCAL_YAW ? 0.0f : FF.mz_nm;
+    const float force_z =
+        MZ / PARAM.wheel_to_center +
+        (LOCAL_YAW ? pid_omega_.Calculate(motion_.setpoint.wz_rad_s,
+                                          motion_.measured.wz_rad_s, dt_)
+                   : 0.0f);
 
     /* 按全向轮受力方向分配前馈力 */
     output_.force_setpoint[0] = (-SQRT2 * FX - SQRT2 * FY + force_z) / 4;
@@ -1019,7 +712,7 @@ class Omni {
   /**
    * @brief 当前生效的导航力前馈（已限幅）
    * @details 仅导航来源、平移受控模式且 30 ms 内收到有效值时生效，否则为零。
-   *          RELAX/INDEPENDENT 与遥控来源不叠加。
+   *          RELAX/INDEPENDENT 与遥控来源不启用。
    */
   CMD::NavigationFeedforward ActiveFeedforward() const {
     CMD::NavigationFeedforward ff{};
@@ -1123,19 +816,10 @@ class Omni {
    * 主题，是底盘倾角前馈的直接来源。yawmotor_angle 仅用于
    * FOLLOW/ROTOR 的指令旋转变换，勿动其 wrap/zero 语义。 */
   struct MotionState {
-    CMD::NavigationVelocity setpoint{};
-    CMD::NavigationVelocity measured{};
-    DesiredAcceleration acceleration{};
-    SecondOrderSetFollow planner_x{};
-    SecondOrderSetFollow planner_y{};
-    SecondOrderSetFollow planner_wz{};
-    CMD::ChassisCommandSource reference_source =
-        CMD::ChassisCommandSource::OPERATOR;
-    ChassisMode reference_mode = ChassisMode::RELAX;
-    bool reference_initialized = false;
+    CMD::ChassisVelocity setpoint{};
+    CMD::ChassisVelocity measured{};
     LibXR::EulerAngle<float> euler{};
     float yawmotor_angle = 0.0f;
-    float gyro_wz = 0.0f;             /* 本板 IMU 陀螺 z（rad/s） */
     float rotor_dynamic_scale = 1.0f; /* 功率相关动态缩放 */
   };
   MotionState motion_;
@@ -1145,7 +829,6 @@ class Omni {
    * PowerControlUpdate() → OutputToDynamics() 各级生产/消费，
    * 跨函数因此保留为成员；同函数生灭的中间量一律局部化。 */
   struct OutputStage {
-    CMD::NavigationFeedforward inertial_feedforward{};
     float omega_setpoint[4]{};
     float force_setpoint[4]{};
     float torque_output[4]{};
@@ -1175,7 +858,6 @@ class Omni {
 
   float dt_ = 0;
   LibXR::MicrosecondTimestamp last_online_time_ = 0;
-  LibXR::MicrosecondTimestamp last_gyro_time_ = 0; /* 陀螺新鲜度判据 */
   LibXR::MicrosecondTimestamp measured_time_us_ =
       0; /* 最近一次正解算的采样时刻 */
   static constexpr uint64_t FF_TIMEOUT_US =

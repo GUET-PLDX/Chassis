@@ -53,8 +53,6 @@ class Chassis {
     float rotor_speed_scale = 1.0f;
     float max_acceleration_mps2 = 2.0f;
     float max_angular_acceleration_rad_s2 = 4.0f;
-    float max_jerk_mps3 = 10.0f;
-    float max_angular_jerk_rad_s3 = 20.0f;
     float mass_kg = 0.0f;
     float yaw_inertia_kg_m2 = 0.0f;
     float gravity_height = 0.0f;
@@ -67,7 +65,7 @@ class Chassis {
     float rotor_buffer_low_j = 35.0f;
     float rotor_buffer_high_j = 70.0f;
     float rotor_scale_lpf_alpha = 0.2f;
-    /* 0 按质量/惯量和规划加速度推导，正数覆盖，负值关闭。 */
+    /* 0 按质量/惯量和加速度限幅值推导，正数覆盖，负值关闭。 */
     float ff_max_force_n = 0.0f;
     float ff_max_torque_nm = 0.0f;
   };
@@ -267,7 +265,7 @@ class Chassis {
       const auto positive = [](float value) {
         return std::isfinite(value) && value > 0.0f ? value : 0.0f;
       };
-      // X/Y 分别限加速度，因此平移合力限值带 sqrt(2)。
+      // 用配置的逐轴加速度限幅值推导导航合力上限。
       param.ff_max_force_n = positive(
           chassis_param.ff_max_force_n == 0.0f
               ? std::numbers::sqrt2_v<float> * positive(chassis_param.mass_kg) *
@@ -278,13 +276,6 @@ class Chassis {
               ? positive(chassis_param.yaw_inertia_kg_m2) *
                     positive(chassis_param.max_angular_acceleration_rad_s2)
               : chassis_param.ff_max_torque_nm);
-      param.max_acceleration_mps2 = chassis_param.max_acceleration_mps2;
-      param.max_angular_acceleration_rad_s2 =
-          chassis_param.max_angular_acceleration_rad_s2;
-      param.max_jerk_mps3 = chassis_param.max_jerk_mps3;
-      param.max_angular_jerk_rad_s3 = chassis_param.max_angular_jerk_rad_s3;
-      param.mass_kg = chassis_param.mass_kg;
-      param.yaw_inertia_kg_m2 = chassis_param.yaw_inertia_kg_m2;
     }
     return param;
   }
