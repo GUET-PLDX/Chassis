@@ -39,11 +39,10 @@ class Helm {
   struct ChassisParam {
     float wheel_radius = 0.0f;
     float wheel_to_center = 0.0f;
-    float gravity_height = 0.0f;
     float reduction_ratio = 0.0f;
     float wheel_resistance = 0.0f;
     float error_compensation = 0.0f;
-    float gravity = 0.0f;
+    float mass_kg = 0.0f;
     float length = 0.0f;
     float width = 0.0f;
     float rotor_speed_scale = 1.0f;      /* 平移输入下的小陀螺缩放 */
@@ -105,7 +104,8 @@ class Helm {
        LibXR::PID<float>::Param pid_steer_speed_1,
        LibXR::PID<float>::Param pid_steer_speed_2,
        LibXR::PID<float>::Param pid_steer_speed_3,
-       LibXR::Thread::Priority thread_priority = LibXR::Thread::Priority::HIGH)
+       LibXR::Thread::Priority thread_priority = LibXR::Thread::Priority::HIGH,
+       ChassisTopicNames topic_names = {})
       : PARAM(chassis_param),
         motor_wheel_0_(motor_wheel_0),
         motor_wheel_1_(motor_wheel_1),
@@ -152,11 +152,13 @@ class Helm {
       motor_steer_cmd_[i].kd = 0.0f;
     }
 
+    topic_names_ = topic_names;
     thread_.Create(this, ThreadFunction, "HelmChassisThread", task_stack_depth,
                    thread_priority);
     auto lost_ctrl_callback = LibXR::Callback<uint32_t>::Create(
         [](bool in_isr, Helm* helm, uint32_t event_id) {
-          UNUSED(in_isr);
+          ASSERT(!in_isr);
+          if (in_isr) return;
           UNUSED(event_id);
           helm->mutex_.Lock();
           helm->chassis_event_ = ChassisMode::RELAX;
@@ -175,9 +177,10 @@ class Helm {
   static void ThreadFunction(Helm* helm) {
     helm->mutex_.Lock();
 
-    LibXR::Topic::ASyncSubscriber<CMD::ChassisCMD> cmd_suber("chassis_cmd");
+    LibXR::Topic::ASyncSubscriber<CMD::ChassisCMD> cmd_suber(
+        helm->topic_names_.chassis_cmd);
     LibXR::Topic::ASyncSubscriber<Referee::ChassisPack> referee_suber(
-        "chassis_ref");
+        helm->topic_names_.chassis_ref);
     LibXR::Topic::ASyncSubscriber<float> yawmotor_angle_suber("yawmotor_angle");
 
     cmd_suber.StartWaiting();
@@ -189,6 +192,7 @@ class Helm {
 
     helm->mutex_.Unlock();
     while (true) {
+      /* 取数只碰订阅者私有数据，放在锁外，避免与 topic 内部同步形成嵌套锁 */
       if (cmd_suber.Available()) {
         helm->cmd_data_ = cmd_suber.GetData();
         cmd_suber.StartWaiting();
@@ -206,13 +210,16 @@ class Helm {
         yawmotor_angle_suber.StartWaiting();
       }
 
+      /* 锁只保护与其他上下文共享的状态机与 PID：算完即解锁 */
       helm->mutex_.Lock();
       helm->Update();
       helm->UpdateCMD();
       helm->Helmcontrol();
       helm->PowerControlUpdate();
-      helm->Output();
       helm->mutex_.Unlock();
+
+      /* 驱动 I/O 与跨板发布留在锁外，不拖延模式切换与双板遥测 */
+      helm->Output();
       helm->topic_delta_yaw_.Publish(helm->delta_yaw_);
       helm->thread_.SleepUntil(last_time, 2);
     }
@@ -274,9 +281,9 @@ class Helm {
    * @details 从CMD获取底盘控制指令,速控底盘
    */
   void UpdateCMD() {
-    target_vx_ = cmd_data_.operator_input.x;
-    target_vy_ = cmd_data_.operator_input.y;
-    target_omega_ = cmd_data_.operator_input.z;
+    target_vx_ = cmd_data_.vx;
+    target_vy_ = cmd_data_.vy;
+    target_omega_ = cmd_data_.wz;
   }
 
   /**
@@ -352,18 +359,16 @@ class Helm {
         target_vy_ = 0.0f;
         break;
       case (ChassisMode::INDEPENDENT): {
-        target_vx_ = cmd_data_.operator_input.x;
-        target_vy_ = cmd_data_.operator_input.y;
+        target_vx_ = cmd_data_.vx;
+        target_vy_ = cmd_data_.vy;
       } break;
       case (ChassisMode::FOLLOW):
       case (ChassisMode::ROTOR): {
         float beta = current_yaw_;
         float cos_beta = cosf(beta);
         float sin_beta = sinf(beta);
-        target_vx_ = cos_beta * cmd_data_.operator_input.x -
-                     sin_beta * cmd_data_.operator_input.y;
-        target_vy_ = sin_beta * cmd_data_.operator_input.x +
-                     cos_beta * cmd_data_.operator_input.y;
+        target_vx_ = cos_beta * cmd_data_.vx - sin_beta * cmd_data_.vy;
+        target_vy_ = sin_beta * cmd_data_.vx + cos_beta * cmd_data_.vy;
       } break;
 
       default:
@@ -379,14 +384,14 @@ class Helm {
         break;
       case (ChassisMode::INDEPENDENT):
         /* 独立模式每个轮子的方向相同，wz当作轮子转向角速度 */
-        target_omega_ = -cmd_data_.operator_input.z;
+        target_omega_ = -cmd_data_.wz;
         break;
       case (ChassisMode::FOLLOW):
         target_omega_ = pid_follow_.Calculate(0.0f, current_yaw_, dt_);
         break;
       case (ChassisMode::ROTOR):
         /* 陀螺模式底盘以一定速度旋转 */
-        target_omega_ = -cmd_data_.operator_input.z;
+        target_omega_ = -cmd_data_.wz;
         break;
       default:
         target_omega_ = 0.0f;
@@ -504,6 +509,9 @@ class Helm {
   static constexpr float SQRT2 = static_cast<float>(std::numbers::sqrt2);
 
   const ChassisParam PARAM;
+
+  /* 订阅的 Topic 名称，由 Chassis::Param 在构造时传入 */
+  ChassisTopicNames topic_names_{};
 
   float target_vx_ = 0.0f;
   float target_vy_ = 0.0f;

@@ -40,11 +40,10 @@ class Mecanum {
   struct ChassisParam {
     float wheel_radius = 0.0f;
     float wheel_to_center = 0.0f;
-    float gravity_height = 0.0f;
     float reduction_ratio = 0.0f;
     float wheel_resistance = 0.0f;
     float error_compensation = 0.0f;
-    float gravity = 0.0f;
+    float mass_kg = 0.0f;
     float length = 0.0f;
     float width = 0.0f;
     float rotor_speed_scale =
@@ -109,7 +108,8 @@ class Mecanum {
       LibXR::PID<float>::Param pid_steer_speed_1,
       LibXR::PID<float>::Param pid_steer_speed_2,
       LibXR::PID<float>::Param pid_steer_speed_3,
-      LibXR::Thread::Priority thread_priority = LibXR::Thread::Priority::MEDIUM)
+      LibXR::Thread::Priority thread_priority = LibXR::Thread::Priority::MEDIUM,
+      ChassisTopicNames topic_names = {})
       /*
        * 麦轮编号，箭头为轮子正方向
        *
@@ -166,11 +166,13 @@ class Mecanum {
     track_wheel_command_.kp = 0.0f;
     track_wheel_command_.kd = 0.0f;
 
+    topic_names_ = topic_names;
     thread_.Create(this, ThreadFunction, "MecanumChassisThread",
                    task_stack_depth, thread_priority);
     auto start_ctrl_callback = LibXR::Callback<uint32_t>::Create(
         [](bool in_isr, Mecanum* mecanum, uint32_t event_id) {
-          UNUSED(in_isr);
+          ASSERT(!in_isr);
+          if (in_isr) return;
           UNUSED(event_id);
           mecanum->mutex_.Lock();
           mecanum->chassis_event_ = ChassisMode::RELAX;
@@ -180,7 +182,8 @@ class Mecanum {
 
     auto lost_ctrl_callback = LibXR::Callback<uint32_t>::Create(
         [](bool in_isr, Mecanum* mecanum, uint32_t event_id) {
-          UNUSED(in_isr);
+          ASSERT(!in_isr);
+          if (in_isr) return;
           UNUSED(event_id);
           mecanum->mutex_.Lock();
           mecanum->chassis_event_ = ChassisMode::RELAX;
@@ -206,9 +209,10 @@ class Mecanum {
   static void ThreadFunction(Mecanum* mecanum) {
     mecanum->mutex_.Lock();
 
-    LibXR::Topic::ASyncSubscriber<CMD::ChassisCMD> cmd_suber("chassis_cmd");
+    LibXR::Topic::ASyncSubscriber<CMD::ChassisCMD> cmd_suber(
+        mecanum->topic_names_.chassis_cmd);
     LibXR::Topic::ASyncSubscriber<Referee::ChassisPack> referee_suber(
-        "chassis_ref");
+        mecanum->topic_names_.chassis_ref);
     LibXR::Topic::ASyncSubscriber<float> yawmotor_angle_suber("yawmotor_angle");
 
     cmd_suber.StartWaiting();
@@ -221,6 +225,7 @@ class Mecanum {
     mecanum->mutex_.Unlock();
 
     while (true) {
+      /* 取数只碰订阅者私有数据，放在锁外，避免与 topic 内部同步形成嵌套锁 */
       if (cmd_suber.Available()) {
         mecanum->cmd_data_ = cmd_suber.GetData();
         cmd_suber.StartWaiting();
@@ -237,6 +242,7 @@ class Mecanum {
         yawmotor_angle_suber.StartWaiting();
       }
 
+      /* 锁只保护与其他上下文共享的状态机与 PID：算完即解锁 */
       mecanum->mutex_.Lock();
       mecanum->Update();
       mecanum->UpdateTrack();
@@ -247,8 +253,10 @@ class Mecanum {
       mecanum->CalculateMotorCurrent();
       mecanum->CalculateTrackCurrent();
       mecanum->PowerControlUpdate();
-      mecanum->OutputToDynamics();
       mecanum->mutex_.Unlock();
+
+      /* 驱动 I/O 留在锁外，不拖延模式切换与双板遥测 */
+      mecanum->OutputToDynamics();
       mecanum->ControlTrack();
 
       mecanum->thread_.SleepUntil(last_time, 2);
@@ -316,8 +324,7 @@ class Mecanum {
         break;
 
       case (ChassisMode::INDEPENDENT):
-        chassis_omega_setpoint_ =
-            -max_v * cmd_data_.operator_input.z / PARAM.wheel_to_center;
+        chassis_omega_setpoint_ = -max_v * cmd_data_.wz / PARAM.wheel_to_center;
         break;
 
       case (ChassisMode::ROTOR):
@@ -356,25 +363,24 @@ class Mecanum {
         float beta = -current_yaw_;
         float cos_beta = cosf(beta);
         float sin_beta = sinf(beta);
-        chassis_vx_setpoint_ = (cos_beta * cmd_data_.operator_input.x * max_v +
-                                sin_beta * cmd_data_.operator_input.y * max_v);
-        chassis_vy_setpoint_ = (-sin_beta * cmd_data_.operator_input.x * max_v +
-                                cos_beta * cmd_data_.operator_input.y * max_v);
+        chassis_vx_setpoint_ =
+            (cos_beta * cmd_data_.vx * max_v + sin_beta * cmd_data_.vy * max_v);
+        chassis_vy_setpoint_ = (-sin_beta * cmd_data_.vx * max_v +
+                                cos_beta * cmd_data_.vy * max_v);
       } break;
       case (ChassisMode::TRACK_START): {
         float beta = -current_yaw_;
         float cos_beta = cosf(beta);
         float sin_beta = sinf(beta);
         /* 履带负责前后，麦轮保留横移能力 */
-        float assist_vx =
-            cmd_data_.operator_input.x * max_v * TRACK_LATERAL_SPEED_SCALE;
+        float assist_vx = cmd_data_.vx * max_v * TRACK_LATERAL_SPEED_SCALE;
         float assist_vy = GetTrackWheelAssistSpeed();
         chassis_vx_setpoint_ = cos_beta * assist_vx + sin_beta * assist_vy;
         chassis_vy_setpoint_ = -sin_beta * assist_vx + cos_beta * assist_vy;
       } break;
       case (ChassisMode::INDEPENDENT): {
-        chassis_vx_setpoint_ = cmd_data_.operator_input.x * max_v;
-        chassis_vy_setpoint_ = cmd_data_.operator_input.y * max_v;
+        chassis_vx_setpoint_ = cmd_data_.vx * max_v;
+        chassis_vy_setpoint_ = cmd_data_.vy * max_v;
       } break;
       default:
         break;
@@ -649,18 +655,18 @@ class Mecanum {
   }
   float GetTrackCommandMagnitude() const {
     /* 遥控 y 先缩放再开方让低速段更细 */
-    const float INPUT = cmd_data_.operator_input.y * TRACK_INPUT_SCALE;
+    const float INPUT = cmd_data_.vy * TRACK_INPUT_SCALE;
     return std::sqrt(std::abs(INPUT)) * TRACK_MAX_LINEAR_SPEED_MPS;
   }
   float GetTrackSetpointSpeed() const {
     /* 履带电机方向和底盘前进方向相反 */
-    const float INPUT = cmd_data_.operator_input.y * TRACK_INPUT_SCALE;
+    const float INPUT = cmd_data_.vy * TRACK_INPUT_SCALE;
     const float SIGN = (INPUT < 0.0f) ? 1.0f : -1.0f;
     return SIGN * GetTrackCommandMagnitude();
   }
   float GetTrackWheelAssistSpeed() const {
     /* 麦轮辅助方向和底盘前进方向一致 */
-    const float INPUT = cmd_data_.operator_input.y * TRACK_INPUT_SCALE;
+    const float INPUT = cmd_data_.vy * TRACK_INPUT_SCALE;
     const float SIGN = (INPUT < 0.0f) ? -1.0f : 1.0f;
     return SIGN * GetTrackCommandMagnitude() * TRACK_WHEEL_ASSIST_SCALE;
   }
@@ -835,6 +841,9 @@ class Mecanum {
   static constexpr float WHEEL_COUNT_FLOAT = 4.0f;
 
   const ChassisParam PARAM;
+
+  /* 订阅的 Topic 名称，由 Chassis::Param 在构造时传入 */
+  ChassisTopicNames topic_names_{};
 
   float wheel_omega_setpoint_[4]{0.0f, 0.0f, 0.0f, 0.0f};
   float wheel_force_setpoint_[4]{0.0f, 0.0f, 0.0f, 0.0f};
