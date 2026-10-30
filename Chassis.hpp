@@ -4,11 +4,11 @@
 /* === MODULE MANIFEST V2 ===
 module_description: No description provided
 depends:
-- id: GUET-PLDX/BMI088
+- id: xrobot-org/BMI088
 - id: GUET-PLDX/Motor
 - id: GUET-PLDX/RMMotor
 - id: GUET-PLDX/CMD
-- id: GUET-PLDX/MadgwickAHRS
+- id: xrobot-org/MadgwickAHRS
 - id: GUET-PLDX/PowerControl
 - id: GUET-PLDX/Referee
 - id: GUET-PLDX/SuperPower
