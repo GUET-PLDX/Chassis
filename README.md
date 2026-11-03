@@ -84,8 +84,8 @@ Modules/Chassis/Chassis.hpp
 
 ## 运动目标与驱动力前馈
 
-`CMD::ChassisCMD` 携带 `vx/vy/wz`、`fx_n/fy_n/mz_nm/ff_valid` 及 `self_define`。Omni 在 NAVIGATION 模式直接使用车体系速度（m/s、m/s、rad/s），在 INDEPENDENT/FOLLOW/ROTOR 模式保留归一化摇杆映射、云台坐标旋转和模式偏航控制。
+`CMD::ChassisCMD` 携带 `vx/vy/wz`、`fx_n/fy_n/mz_nm/ff_valid` 及 `self_define`。Omni 在 NAVIGATION 模式直接使用车体系速度（m/s、m/s、rad/s）；NAVIGATION_ROTOR 同样直接使用车体系平移速度，并沿用 ROTOR 的底盘自旋和功率缩放。在 INDEPENDENT/FOLLOW/ROTOR 模式保留归一化摇杆映射、云台坐标旋转和模式偏航控制。
 
 速度 PID、轮速 PID、坡度和阻力补偿持续工作。复合命令的有效力/力矩在 30ms 保鲜期内经独立限幅后叠加到速度反馈输出，再分配四轮驱动力；失效后前馈归零，速度反馈继续执行。RELAX 模式失能电机。
 
-当前上位机底盘包仅提供 Fx/Fy/Mz，因此 HostData/HostDataLink 提交零速度目标和独立力前馈。该输入会同时受到零速 PID 反馈；要跟踪非零速度轨迹，需要上游提供相应的速度目标。修改反馈/前馈组合后应重新验证 PID 增益、坡度补偿与主机模型的一致性。
+当前 HostDataLink 接收上位机变换后的车体系速度并关闭力前馈。修改反馈/前馈组合后应重新验证 PID 增益、坡度补偿与主机模型的一致性。

@@ -205,6 +205,8 @@ class Chassis {
     if constexpr (std::is_same<ChassisType, Omni>::value) {
       chassis_event_.Register(static_cast<uint32_t>(ChassisMode::NAVIGATION),
                               callback);
+      chassis_event_.Register(
+          static_cast<uint32_t>(ChassisMode::NAVIGATION_ROTOR), callback);
     }
     /*
      * TRACK_START 只属于麦轮

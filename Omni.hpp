@@ -65,6 +65,7 @@ class Omni {
     ROTOR,
     FOLLOW,
     NAVIGATION,
+    NAVIGATION_ROTOR = 6,
   };
 
   /**
@@ -335,6 +336,7 @@ class Omni {
         break;
 
       case ChassisMode::ROTOR:
+      case ChassisMode::NAVIGATION_ROTOR:
         motion_.setpoint.wz_rad_s =
             -static_cast<float>(max_v / PARAM.wheel_to_center);
         break;
@@ -377,6 +379,7 @@ class Omni {
         motion_.setpoint.vy_mps = SQRT2 * k * cmd_data_.vy;
       } break;
       case ChassisMode::NAVIGATION:
+      case ChassisMode::NAVIGATION_ROTOR:
         motion_.setpoint.vx_mps = cmd_data_.vx;
         motion_.setpoint.vy_mps = cmd_data_.vy;
         break;
@@ -386,7 +389,8 @@ class Omni {
 
     /* 旋转模式按平移输入和功率状态动态压低转速 */
     float rotor_translation_scale = 1.0f;
-    if (chassis_event_ == ChassisMode::ROTOR) {
+    if (chassis_event_ == ChassisMode::ROTOR ||
+        chassis_event_ == ChassisMode::NAVIGATION_ROTOR) {
       float translation_magnitude =
           sqrtf(motion_.setpoint.vx_mps * motion_.setpoint.vx_mps +
                 motion_.setpoint.vy_mps * motion_.setpoint.vy_mps);
@@ -601,7 +605,8 @@ class Omni {
     motion_.rotor_dynamic_scale = std::clamp(motion_.rotor_dynamic_scale,
                                              PARAM.rotor_omega_min_scale, 1.0f);
 
-    if (chassis_event_ != ChassisMode::ROTOR) {
+    if (chassis_event_ != ChassisMode::ROTOR &&
+        chassis_event_ != ChassisMode::NAVIGATION_ROTOR) {
       motion_.rotor_dynamic_scale = 1.0f;
     }
   }
