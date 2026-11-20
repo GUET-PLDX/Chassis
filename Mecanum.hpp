@@ -840,32 +840,53 @@ class Mecanum {
   static constexpr float TRACK_PRIORITY_WEIGHT_SCALE = 2.5f;
   static constexpr float WHEEL_COUNT_FLOAT = 4.0f;
 
-  const ChassisParam PARAM;
-
-  /* 订阅的 Topic 名称，由 Chassis::Param 在构造时传入 */
-  ChassisTopicNames topic_names_{};
-
-  float wheel_omega_setpoint_[4]{0.0f, 0.0f, 0.0f, 0.0f};
-  float wheel_force_setpoint_[4]{0.0f, 0.0f, 0.0f, 0.0f};
-  float wheel_speed_pid_output_[4]{0.0f, 0.0f, 0.0f, 0.0f};
-
-  float wheel_torque_output_[4]{0.0f, 0.0f, 0.0f, 0.0f};
-
-  float chassis_vx_feedback_ = 0.0f;
-  float chassis_vy_feedback_ = 0.0f;
-  float chassis_omega_feedback_ = 0.0f;
+  CMD::ChassisCMD cmd_data_;
+  ChassisMode chassis_event_ = ChassisMode::RELAX;
+  ChassisMode current_mode_ = ChassisMode::RELAX;
+  float dt_ = 0;
+  LibXR::MicrosecondTimestamp last_online_time_ = 0;
 
   float chassis_vx_setpoint_ = 0.0f;
   float chassis_vy_setpoint_ = 0.0f;
   float chassis_omega_setpoint_ = 0.0f;
   float rotor_dynamic_scale_ = 1.0f; /* 功率相关动态缩放 */
+  float wheel_omega_setpoint_[4]{0.0f, 0.0f, 0.0f, 0.0f};
+  float wheel_force_setpoint_[4]{0.0f, 0.0f, 0.0f, 0.0f};
+  float track_linear_speed_ = 0.0f;
+  float track_target_speed_ = 0.0f;
 
+  float chassis_vx_feedback_ = 0.0f;
+  float chassis_vy_feedback_ = 0.0f;
+  float chassis_omega_feedback_ = 0.0f;
   float current_yaw_ = 0.0f;
+  bool motor_online_3508_[5]{};
+  Motor::Feedback wheel_feedback_[4]{};
+  float track_wheel_speed_error_ = 0.0f;
+  Motor::Feedback track_wheel_feedback_{};
+
+  float wheel_speed_pid_output_[4]{0.0f, 0.0f, 0.0f, 0.0f};
+  float wheel_torque_output_[4]{0.0f, 0.0f, 0.0f, 0.0f};
+  Motor::MotorCmd wheel_command_[4]{};
+  float track_torque_output_current_ = 0.0f;
+  Motor::MotorCmd track_wheel_command_{};
+
+  MotorData motor_data_{};
+  PowerControlData power_control_data_;
+  Referee::ChassisPack referee_chassis_pack_{};
+  uint16_t cnt_high = 0;
+  uint16_t cnt_low = 0;
+  float cap_ener = 0.0f;
+
+  uint16_t ui_step_ = 0;
+  uint16_t ui_dyn_step_ = 0;
+  ChassisMode last_ui_mode_ = ChassisMode::RELAX;
+  LibXR::MillisecondTimestamp ui_update_time_ = 0;
+
+  const ChassisParam PARAM;
+
+  /* 订阅的 Topic 名称，由 Chassis::Param 在构造时传入 */
+  ChassisTopicNames topic_names_{};
   float yawmotor_zero_ = 0.0f;
-
-  float dt_ = 0;
-  LibXR::MicrosecondTimestamp last_online_time_ = 0;
-
   Motor* motor_wheel_0_;
   Motor* motor_wheel_1_;
   Motor* motor_wheel_2_;
@@ -874,10 +895,6 @@ class Mecanum {
 
   Motor* motor_wheel_[4]{motor_wheel_0_, motor_wheel_1_, motor_wheel_2_,
                          motor_wheel_3_};
-  bool motor_online_3508_[5]{};
-  Motor::Feedback wheel_feedback_[4]{};
-  Motor::MotorCmd wheel_command_[4]{};
-  MotorData motor_data_{};
 
   LibXR::PID<float> pid_follow_;
   LibXR::PID<float> pid_velocity_x_;
@@ -904,34 +921,9 @@ class Mecanum {
       LibXR::PID<float>(LibXR::PID<float>::Param()),
       LibXR::PID<float>(LibXR::PID<float>::Param())};
 
-  float track_linear_speed_ = 0.0f;
-  float track_target_speed_ = 0.0f;
-  float track_wheel_speed_error_ = 0.0f;
-  float track_torque_output_current_ = 0.0f;
-  Motor::Feedback track_wheel_feedback_{};
-  Motor::MotorCmd track_wheel_command_{};
-
   CMD* cmd_;
-  CMD::ChassisCMD cmd_data_;
-
   PowerControl* power_control_;
-  PowerControlData power_control_data_;
-
-  Referee::ChassisPack referee_chassis_pack_{};
-
   LibXR::Thread thread_;
   LibXR::Mutex mutex_;
-
-  ChassisMode chassis_event_ = ChassisMode::RELAX;
   Referee* referee_;
-
-  uint16_t ui_step_ = 0;
-  uint16_t ui_dyn_step_ = 0;
-  ChassisMode current_mode_ = ChassisMode::RELAX;
-  ChassisMode last_ui_mode_ = ChassisMode::RELAX;
-  LibXR::MillisecondTimestamp ui_update_time_ = 0;
-
-  uint16_t cnt_high = 0;
-  uint16_t cnt_low = 0;
-  float cap_ener = 0.0f;
 };

@@ -698,12 +698,8 @@ class Omni {
 
  private:
   /* === 状态分层（对齐 Gimbal 范式）===
-   * 1. PARAM    构造期配置，const；
-   * 2. wheel_   执行器层：电机句柄 + 每轮反馈/命令/在线状态；
-   * 3. motion_  运动状态：跨周期、watch 主要观测入口；
-   * 4. output_  输出链：单周期内跨函数生产/消费的中间量；
-   * 5. power_   功率遥测：与 PowerControl 的往返数据。
-   * 其余平铺成员与 Gimbal 同构：PID 组 / 时序 / 模式 / 框架句柄。
+   * 指令、模式与时序 → 运动目标和反馈 → 输出与功率遥测
+   * → 配置、轮组、PID 和框架句柄。
    * 调试：watch `chassis.chassis_` 按声明顺序展开以上节点。 */
 
   /* 几何/运动学常量（来自 <numbers>，与旧字面量逐位一致）。
@@ -711,26 +707,13 @@ class Omni {
   static constexpr float SQRT2 = static_cast<float>(std::numbers::sqrt2);
   static constexpr float INV_SQRT2 = SQRT2 / 2.0f;
 
-  const ChassisParam PARAM;
-
-  /* 订阅的 Topic 名称，由 Chassis::Param 在构造时传入 */
-  ChassisTopicNames topic_names_{};
-
-  /* 执行器层。电机布局：
-   *  wheel0   ▲ y  wheel3
-   *      ↙    │     ↖
-   *           │
-   *  ─────────┼────────▶x
-   *           │
-   *      ↘    │     ↗
-   *  wheel1   │    wheel2 */
-  struct Wheels {
-    Motor* motor[4]{};
-    Motor::Feedback feedback[4]{};
-    Motor::MotorCmd command[4]{}; /* 恒 MODE_TORQUE，构造期置参 */
-    bool online[4]{};
-  };
-  Wheels wheel_;
+  CMD::ChassisCMD cmd_data_{};
+  ChassisMode chassis_event_ = ChassisMode::RELAX;
+  float dt_ = 0;
+  LibXR::MicrosecondTimestamp last_online_time_ = 0;
+  LibXR::MicrosecondTimestamp measured_time_us_ =
+      0; /* 最近一次正解算的采样时刻 */
+  LibXR::MicrosecondTimestamp last_cmd_time_ = 0;
 
   /* 车体系运动状态（m/s、rad/s）。setpoint 由 UpdateCMD() 解析，
    * measured 由 SelfResolution() 正解；euler 来自本板 chassis_euler
@@ -764,6 +747,29 @@ class Omni {
   };
   PowerStage power_;
 
+  Referee::ChassisPack referee_chassis_pack_{};
+
+  const ChassisParam PARAM;
+
+  /* 订阅的 Topic 名称，由 Chassis::Param 在构造时传入 */
+  ChassisTopicNames topic_names_{};
+
+  /* 执行器层。电机布局：
+   *  wheel0   ▲ y  wheel3
+   *      ↙    │     ↖
+   *           │
+   *  ─────────┼────────▶x
+   *           │
+   *      ↘    │     ↗
+   *  wheel1   │    wheel2 */
+  struct Wheels {
+    Motor* motor[4]{};
+    Motor::Feedback feedback[4]{};
+    Motor::MotorCmd command[4]{}; /* 恒 MODE_TORQUE，构造期置参 */
+    bool online[4]{};
+  };
+  Wheels wheel_;
+
   LibXR::PID<float> pid_follow_;
   LibXR::PID<float> pid_velocity_x_;
   LibXR::PID<float> pid_velocity_y_;
@@ -775,22 +781,10 @@ class Omni {
       LibXR::PID<float>(LibXR::PID<float>::Param()),
       LibXR::PID<float>(LibXR::PID<float>::Param())};
 
-  float dt_ = 0;
-  LibXR::MicrosecondTimestamp last_online_time_ = 0;
-  LibXR::MicrosecondTimestamp measured_time_us_ =
-      0; /* 最近一次正解算的采样时刻 */
   static constexpr uint64_t COMMAND_FF_TIMEOUT_US =
       30000; /* 力前馈新鲜度：3 个 CAN 周期 */
-  LibXR::MicrosecondTimestamp last_cmd_time_ = 0;
-
-  ChassisMode chassis_event_ = ChassisMode::RELAX;
-
   CMD* cmd_;
-  CMD::ChassisCMD cmd_data_{};
-
   PowerControl* power_control_;
-  Referee::ChassisPack referee_chassis_pack_{};
-
   LibXR::Thread thread_;
   LibXR::Mutex mutex_;
 };

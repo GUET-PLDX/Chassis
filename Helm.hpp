@@ -508,36 +508,45 @@ class Helm {
   /* 几何/运动学常量（来自 <numbers>，与旧字面量逐位一致） */
   static constexpr float SQRT2 = static_cast<float>(std::numbers::sqrt2);
 
-  const ChassisParam PARAM;
-
-  /* 订阅的 Topic 名称，由 Chassis::Param 在构造时传入 */
-  ChassisTopicNames topic_names_{};
+  CMD::ChassisCMD cmd_data_;
+  ChassisMode chassis_event_ = ChassisMode::RELAX;
+  float dt_ = 0;
+  LibXR::MicrosecondTimestamp last_online_time_ = 0;
 
   float target_vx_ = 0.0f;
   float target_vy_ = 0.0f;
   float target_omega_ = 0.0f;
-
-  bool motor_reverse_[4]{false, false, false, false};
-  LibXR::CycleValue<float> zero_[4] = {1.10063124, 2.05323339, 3.2244277,
-                                       0.979446769};
-  float current_yaw_ = 0.0f;
-  float delta_yaw_ = 0.0f;
-
   /* 转子的转速 */
   float target_speed_[4] = {0.0f, 0.0f, 0.0f, 0.0f};
   LibXR::CycleValue<float> target_angle_[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+  float current_yaw_ = 0.0f;
+  float delta_yaw_ = 0.0f;
+  LibXR::CycleValue<float> main_direct_ = 0.0f;
+  bool motor_reverse_[4]{false, false, false, false};
+  bool motor_online_3508_[4]{};
+  bool motor_online_6020_[4]{};
+  Motor::Feedback motor_wheel_feedback_[4]{};
+  Motor::Feedback motor_steer_feedback_[4]{};
 
   /* 输出的电流值 */
   float wheel_out_[4] = {0.0f, 0.0f, 0.0f, 0.0f};
   float steer_out_[4] = {0.0f, 0.0f, 0.0f, 0.0f};
   float steer_angle_[4] = {0.0, 0.0, 0.0, 0.0};
+  Motor::MotorCmd motor_wheel_cmd_[4]{};
+  Motor::MotorCmd motor_steer_cmd_[4]{};
 
+  MotorData motor_data_ = {};
+  PowerControlData power_control_data_;
+  Referee::ChassisPack referee_chassis_pack_{};
+
+  const ChassisParam PARAM;
+
+  /* 订阅的 Topic 名称，由 Chassis::Param 在构造时传入 */
+  ChassisTopicNames topic_names_{};
+  LibXR::CycleValue<float> zero_[4] = {1.10063124, 2.05323339, 3.2244277,
+                                       0.979446769};
   float motor_max_speed_ = 9000.0;
-
-  LibXR::CycleValue<float> main_direct_ = 0.0f;
-
-  float dt_ = 0;
-  LibXR::MicrosecondTimestamp last_online_time_ = 0;
 
   Motor* motor_wheel_0_;
   Motor* motor_wheel_1_;
@@ -552,11 +561,6 @@ class Helm {
                             motor_wheel_3_};
   Motor* motor_steer_[4] = {motor_steer_0_, motor_steer_1_, motor_steer_2_,
                             motor_steer_3_};
-
-  bool motor_online_3508_[4]{};
-  bool motor_online_6020_[4]{};
-  Motor::Feedback motor_wheel_feedback_[4]{};
-  Motor::Feedback motor_steer_feedback_[4]{};
 
   LibXR::PID<float> pid_follow_;
   LibXR::PID<float> pid_velocity_x_;
@@ -580,19 +584,8 @@ class Helm {
       LibXR::PID<float>(LibXR::PID<float>::Param())};
 
   CMD* cmd_;
-  CMD::ChassisCMD cmd_data_;
-
-  Motor::MotorCmd motor_wheel_cmd_[4]{};
-  Motor::MotorCmd motor_steer_cmd_[4]{};
-
-  MotorData motor_data_ = {};
   PowerControl* power_control_;
-  PowerControlData power_control_data_;
-
-  Referee::ChassisPack referee_chassis_pack_{};
   LibXR::Thread thread_;
   LibXR::Mutex mutex_;
-
   LibXR::Topic topic_delta_yaw_ = LibXR::Topic::CreateTopic<float>("delta_yaw");
-  ChassisMode chassis_event_ = ChassisMode::RELAX;
 };
