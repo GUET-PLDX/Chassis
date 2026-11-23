@@ -8,6 +8,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <numbers>
 
 #include "CMD.hpp"
@@ -217,6 +218,7 @@ class Omni {
     omni->mutex_.Unlock();
 
     while (true) {
+      const auto cycle_start = LibXR::Timebase::GetMicroseconds();
       /* 取数只碰订阅者私有数据，放在锁外，避免与 topic 内部同步形成嵌套锁 */
       if (cmd_suber.Available()) {
         omni->cmd_data_ = cmd_suber.GetData();
@@ -248,10 +250,22 @@ class Omni {
       omni->DynamicInverseSolution();
       omni->CalculateMotorCurrent();
       omni->PowerControlUpdate();
-      omni->mutex_.Unlock();
       omni->OutputToDynamics();
+      omni->mutex_.Unlock();
 
-      omni->thread_.SleepUntil(last_time, 1);
+      omni->timing_.cycle_time_us =
+          (LibXR::Timebase::GetMicroseconds() - cycle_start).ToMicrosecond();
+      omni->timing_.max_cycle_time_us =
+          std::max(omni->timing_.max_cycle_time_us, omni->timing_.cycle_time_us);
+      const auto now = LibXR::Timebase::GetMilliseconds();
+      const uint32_t elapsed_ms = (now - last_time).ToMillisecond();
+      if (elapsed_ms >= CONTROL_PERIOD_MS &&
+          elapsed_ms < std::numeric_limits<uint32_t>::max() / 2U) {
+        ++omni->timing_.overrun_count;
+        omni->timing_.missed_periods += elapsed_ms / CONTROL_PERIOD_MS;
+        last_time = now;
+      }
+      omni->thread_.SleepUntil(last_time, CONTROL_PERIOD_MS);
     }
   }
 
@@ -706,6 +720,7 @@ class Omni {
      注意：本工具链 libc++ 无 std::numbers::inv_sqrt2，用精确的 /2 派生。 */
   static constexpr float SQRT2 = static_cast<float>(std::numbers::sqrt2);
   static constexpr float INV_SQRT2 = SQRT2 / 2.0f;
+  static constexpr uint32_t CONTROL_PERIOD_MS = 1U;
 
   CMD::ChassisCMD cmd_data_{};
   ChassisMode chassis_event_ = ChassisMode::RELAX;
@@ -746,6 +761,14 @@ class Omni {
     PowerControlData limited{};
   };
   PowerStage power_;
+
+  struct ControlTiming {
+    uint64_t cycle_time_us = 0;
+    uint64_t max_cycle_time_us = 0;
+    uint32_t overrun_count = 0;
+    uint32_t missed_periods = 0;
+  };
+  ControlTiming timing_;
 
   Referee::ChassisPack referee_chassis_pack_{};
 
