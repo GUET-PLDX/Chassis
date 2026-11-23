@@ -10,8 +10,11 @@ depends:
 - id: GUET-PLDX/CMD
 - id: xrobot-org/MadgwickAHRS
 - id: GUET-PLDX/PowerControl
+  ref: 5d06d27928970a736283d3f6273383534517c4f9
 - id: GUET-PLDX/Referee
+  ref: 4eb967e28d76bfb3004ddb03a565b10741f1d888
 - id: GUET-PLDX/SuperPower
+  ref: 1876c9c8583b75aac027d37ade28ffedca96ffe9
 === END MANIFEST === */
 // clang-format on
 
