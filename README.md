@@ -84,7 +84,7 @@ Modules/Chassis/Chassis.hpp
 
 ## 运动目标与驱动力前馈
 
-`CMD::ChassisCMD` 携带 `vx/vy/wz`、`fx_n/fy_n/mz_nm/ff_valid` 及 `self_define`。Omni 在 NAVIGATION 模式直接使用车体系速度（m/s、m/s、rad/s）；NAVIGATION_ROTOR 同样直接使用车体系平移速度，并沿用 ROTOR 的底盘自旋和功率缩放。在 INDEPENDENT/FOLLOW/ROTOR 模式保留归一化摇杆映射、云台坐标旋转和模式偏航控制。
+`CMD::ChassisCMD` 携带 `vx/vy/wz`、`fx_n/fy_n/mz_nm/ff_valid` 及 `self_define`。Omni 在 `NAVIGATION` 和 `NAVIGATION_ROTOR` 模式使用车体系速度（m/s、m/s、rad/s）。`NAVIGATION_ROTOR` 使用导航下发的有符号 `wz`，并按轮速上限、平移速度和功率状态缩放。`INDEPENDENT`、`FOLLOW` 和 `ROTOR` 模式沿用各自的摇杆映射、云台坐标旋转和偏航控制。
 
 速度 PID、轮速 PID、坡度和阻力补偿持续工作。复合命令的有效力/力矩在 30ms 保鲜期内经独立限幅后叠加到速度反馈输出，再分配四轮驱动力；失效后前馈归零，速度反馈继续执行。RELAX 模式失能电机。
 

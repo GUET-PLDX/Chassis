@@ -210,6 +210,8 @@ class Chassis {
                               callback);
       chassis_event_.Register(
           static_cast<uint32_t>(ChassisMode::NAVIGATION_ROTOR), callback);
+      chassis_event_.Register(static_cast<uint32_t>(ChassisMode::HOLE),
+                              callback);
     }
     /*
      * TRACK_START 只属于麦轮

@@ -67,6 +67,7 @@ class Omni {
     FOLLOW,
     NAVIGATION,
     NAVIGATION_ROTOR = 6,
+    HOLE = 7,
   };
 
   /**
@@ -350,15 +351,25 @@ class Omni {
         break;
 
       case ChassisMode::ROTOR:
-      case ChassisMode::NAVIGATION_ROTOR:
         motion_.setpoint.wz_rad_s =
             -static_cast<float>(max_v / PARAM.wheel_to_center);
         break;
 
+      case ChassisMode::NAVIGATION_ROTOR: {
+        const float max_yaw_rate = max_v / PARAM.wheel_to_center;
+        motion_.setpoint.wz_rad_s =
+            std::clamp(cmd_data_.wz, -max_yaw_rate, max_yaw_rate);
+      } break;
+
         /* 正方向跟随云台 */
       case ChassisMode::FOLLOW:
+      case ChassisMode::HOLE:
         motion_.setpoint.wz_rad_s =
-            -pid_follow_.Calculate(0.0f, motion_.yawmotor_angle, dt_);
+            -pid_follow_.Calculate(
+                chassis_event_ == ChassisMode::HOLE
+                    ? static_cast<float>(LibXR::PI) / 4.0f
+                    : 0.0f,
+                motion_.yawmotor_angle, dt_);
         break;
 
       case ChassisMode::NAVIGATION:
@@ -394,6 +405,7 @@ class Omni {
       } break;
       case ChassisMode::NAVIGATION:
       case ChassisMode::NAVIGATION_ROTOR:
+      case ChassisMode::HOLE:
         motion_.setpoint.vx_mps = cmd_data_.vx;
         motion_.setpoint.vy_mps = cmd_data_.vy;
         break;
