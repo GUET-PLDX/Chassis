@@ -221,9 +221,10 @@ class Omni {
     while (true) {
       const auto cycle_start = LibXR::Timebase::GetMicroseconds();
       /* 取数只碰订阅者私有数据，放在锁外，避免与 topic 内部同步形成嵌套锁 */
-      if (cmd_suber.Available()) {
-        omni->cmd_data_ = cmd_suber.GetData();
-        omni->last_cmd_time_ = LibXR::Timebase::GetMicroseconds();
+      const bool command_available = cmd_suber.Available();
+      CMD::ChassisCMD topic_command{};
+      if (command_available) {
+        topic_command = cmd_suber.GetData();
         cmd_suber.StartWaiting();
       }
 
@@ -244,6 +245,10 @@ class Omni {
 
       /* 锁只保护与其他上下文共享的状态机与 PID：算完即解锁 */
       omni->mutex_.Lock();
+      if (command_available && !omni->coherent_control_) {
+        omni->cmd_data_ = topic_command;
+        omni->last_cmd_time_ = LibXR::Timebase::GetMicroseconds();
+      }
       omni->Update();
       omni->UpdateCMD();
       omni->SelfResolution();
@@ -319,18 +324,33 @@ class Omni {
    * @param mode 要设置的新模式
    */
   void SetMode(uint32_t mode) {
-    mutex_.Lock();
-    const ChassisMode NEXT_MODE = static_cast<ChassisMode>(mode);
-    chassis_event_ = NEXT_MODE;
+    LibXR::Mutex::LockGuard lock(mutex_);
+    SetModeLocked(static_cast<ChassisMode>(mode));
+  }
+
+  bool ApplyControlCommand(ChassisMode mode, const CMD::ChassisCMD& command) {
+    LibXR::Mutex::LockGuard lock(mutex_);
+    coherent_control_ = true;
+    cmd_data_ = command;
+    last_cmd_time_ = LibXR::Timebase::GetMicroseconds();
+    if (chassis_event_ == mode) return false;
+    SetModeLocked(mode);
+    return true;
+  }
+
+ private:
+  void SetModeLocked(ChassisMode mode) {
+    chassis_event_ = mode;
     pid_omega_.Reset();
     pid_velocity_x_.Reset();
     pid_velocity_y_.Reset();
+    pid_follow_.Reset();
     for (int i = 0; i < 4; i++) {
       pid_wheel_speed_[i].Reset();
     }
-    mutex_.Unlock();
   }
 
+ public:
   /**
    * @brief 更新底盘控制指令状态
    * @details 从CMD获取底盘控制指令，并转换为目标速度
@@ -735,6 +755,7 @@ class Omni {
   static constexpr uint32_t CONTROL_PERIOD_MS = 1U;
 
   CMD::ChassisCMD cmd_data_{};
+  bool coherent_control_ = false;
   ChassisMode chassis_event_ = ChassisMode::RELAX;
   float dt_ = 0;
   LibXR::MicrosecondTimestamp last_online_time_ = 0;

@@ -233,6 +233,12 @@ class Chassis {
   /** @brief 获取底盘实现的实际模式。 */
   ChassisMode GetMode() { return chassis_.GetMode(); }
 
+  bool ApplyControlCommand(ChassisMode mode, const CMD::ChassisCMD& command)
+    requires std::is_same_v<ChassisType, Omni>
+  {
+    return chassis_.ApplyControlCommand(mode, command);
+  }
+
   /** @brief 轮速正解算的实测速度快照；仅实现了该接口的底盘（Omni）可调用。 */
   auto GetMeasuredState() { return chassis_.GetMeasuredState(); }
 
